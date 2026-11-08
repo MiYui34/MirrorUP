@@ -733,8 +733,9 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | `rcon` | RCON `stop`（可选先 `say` 倒计时）+ TCP 端口探活 + 可选 `start_cmd` 启动 | v0.4 |
 | `mcsm` | 调用 MCSManager API：v9 用 `apikey` 查询参数，v10 用 `/api/auth/login` 换 Bearer token；`/api/protected_instance/status|stop|start` | v0.5 |
 | `external` | 调用用户提供的命令钩子（`stop_cmd` / `start_cmd` / `probe_cmd`） | v0.4 |
+| `self` | 控制**本 MCDR 自己**托管的服务器：`server.stop()`（不停 MCDR）→ 写盘 → `server.start()`，用于“就地同步” | v0.6 |
 
-`external` 是万能兜底：用户写一个 shell 脚本就能接任何面板。
+`external` 是万能兜底：用户写一个 shell 脚本就能接任何面板。`self` 是唯一不需要外部通道的适配器——它解决的是“镜像服自己也装一份插件、玩家在镜像上敲同步”的部署形态。
 
 **实现细节（v0.4）**：
 
@@ -742,6 +743,14 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 - `rcon` 的启动命令复用 `mirror_control.external.start_cmd`（RCON 只能停不能启）。
 - `stop` 之后轮询到进程真的退出才返回；超时返回失败，同步中止（不会在镜像还在跑的时候写文件）。
 - `start_after_sync=true` 时，同步完自动 `start()` 并 `wait_ready()`；只是"已执行"还是"已确认就绪"会写进 `report.hint`，不会假装成功。
+
+**实现细节（v0.6，`self`）**：
+
+- `server.stop()` 只停服务端、不停 MCDR（源码里 `ServerInterface.stop()` 明确会先 `remove_flag(EXIT_AFTER_STOP)`），所以同步线程不会被一起停掉；`!!MCDR stop` / `server_interface.exit()` 才会让 MCDR 退出。
+- 停服用 `is_server_running()` 轮询到服务端真的退出，再等 `session.lock` 释放；等不到就中止，绝不写入。
+- 停服前可广播 `notify_players_sec` 秒倒计时（`say`），上限 30 秒，避免玩家存东西时被直接踢下线。
+- 第二轮没有变更时完全不碰服务器——不停、不启。
+- `agent` 模式下允许 `source.root` 与目标重合：源端在另一台机器，本地 `source.root` 只参与 `world_id` 计算，不读盘。
 
 ---
 
@@ -816,7 +825,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
   },
 
   "mirror_control": {
-    "adapter": "manual",
+    "adapter": "manual",                   // manual | rcon | external | mcsm | self（v0.6，就地同步）
     "rcon": { "host": "127.0.0.1", "port": 25575, "password": "" },
     "external": { "stop_cmd": "", "start_cmd": "", "probe_cmd": "" },
     "mcsm": {                              // v0.5：MCSM 9 用 apikey，MCSM 10 用 username/password 登录
@@ -1014,6 +1023,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | **v0.3** ✅ | `inplace` append-and-commit + compaction + 头 journal（§8.7） | 写量降到"脏 chunk + 16KB"，崩溃注入后靠 journal 恢复旧头 |
 | **v0.4** ✅ | 跨机 `agent` 传输 + TLS + `rcon`/`external` 停服 + `.mcc` 外置 chunk 增量 + 配置 schema v4 | 同机/跨机结果一致；`.mcc` 改内容能触发同步；停止不了镜像时拒绝写盘 |
 | **v0.5** ✅ | `verify`（浅/深）、同步历史、多镜像目标共享索引（schema v5）、`mcsm` 适配器、`.mcc` 孤儿清理、set 改名复用索引、Python API（`mirror_up.api`） | 多目标各写各的、互不串写；深校验能发现"同大小同 mtime 的源内容变化"；第三方可 `get_api()` 调用 |
+| **v0.6** ✅ | `mirror_control.adapter="self"`：插件装在被同步的那台服上，`!!mu sync` = 停本服 → 从上游拉取 → 拉起本服（§13） | 有变更时先停后写再启；无变更时一步都不做；停不下来就中止且不写 |
 | 可选 | btrfs/zfs snapshot 加速后端、空闲触发、WebUI | — |
 
 ---

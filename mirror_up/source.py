@@ -34,6 +34,7 @@ from .excludes import GlobMatcher
 from .hashing import hash_file, new_hasher
 from .region import (
     ChunkDelta,
+    RegionFormatError,
     RegionScan,
     decode_state,
     parse_header,
@@ -300,9 +301,10 @@ class _HttpClient:
         finally:
             conn.close()
 
-    def get(
+    def get_with_status(
         self, path: str, params: Optional[Dict[str, str]] = None, body: Optional[bytes] = None
-    ) -> bytes:
+    ) -> Tuple[int, bytes]:
+        """和 :meth:`get` 一样，但把状态码交给调用方判断（401 仍然直接抛）。"""
         method = "POST" if body is not None else "GET"
         url = path if not params else f"{path}?{urlencode(params)}"
         conn = self._connection()
@@ -320,6 +322,12 @@ class _HttpClient:
 
         if status == 401:
             raise SourceUnavailable("agent 鉴权失败（token 不匹配）")
+        return status, data
+
+    def get(
+        self, path: str, params: Optional[Dict[str, str]] = None, body: Optional[bytes] = None
+    ) -> bytes:
+        status, data = self.get_with_status(path, params, body)
         if status == 404:
             raise SourceVanished(f"agent 上没有这个文件：{params.get('path') if params else path}")
         if status != 200:
@@ -443,7 +451,7 @@ class AgentSource(Source):
     ) -> RegionScan:
         rel = _as_rel(rel)
         previous = previous or {}
-        data = self.client.get(
+        status, data = self.client.get_with_status(
             "/v1/region",
             {
                 "set": self.set_name,
@@ -451,6 +459,14 @@ class AgentSource(Source):
                 **({"since": str(int(dirty_since))} if dirty_since is not None else {}),
             },
         )
+        if status == 404:
+            raise SourceVanished(f"agent 上源文件不存在：{rel}")
+        if status == 422:
+            # 服务端也解析不了这个 region（损坏或非标准文件）：交给上层降级为整文件复制
+            raise RegionFormatError(_error_message(data) or f"agent 无法解析 {rel}")
+        if status != 200:
+            message = _error_message(data) or f"HTTP {status}"
+            raise SourceError(f"agent 返回错误：{message}")
         try:
             size, mtime_ns, header, served = decode_region_summary(data)
         except (ValueError, TypeError) as exc:

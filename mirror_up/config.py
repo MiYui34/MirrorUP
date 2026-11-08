@@ -702,7 +702,7 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
         if key in seen_roots:
             raise ConfigError(f"多个 target 指向同一目录：{dst}")
         seen_roots.add(key)
-        if _is_within(src, dst) or _is_within(dst, src):
+        if cfg.source.transport == "local" and (_is_within(src, dst) or _is_within(dst, src)):
             raise ConfigError(f"source.root 与 target {target.name!r} 不能互相包含：{src} / {dst}")
 
     if cfg.source.transport not in ("local", "agent"):
@@ -756,8 +756,10 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
         warnings.append("没有任何启用的 set，同步将什么都不做")
 
     def check_control(control: MirrorControlConfig, label: str) -> None:
-        if control.adapter not in ("manual", "rcon", "external", "mcsm"):
+        if control.adapter not in ("manual", "rcon", "external", "mcsm", "self"):
             raise ConfigError(f"未知的 {label}mirror_control.adapter：{control.adapter!r}")
+        if control.adapter == "self" and cfg.role != "driver":
+            raise ConfigError(f"{label}mirror_control.adapter=self 只能用在 role=driver 的节点上")
         if control.adapter == "rcon":
             if not control.rcon.password:
                 warnings.append(f"{label}mirror_control.adapter=rcon 但 rcon.password 为空，停服命令会失败")

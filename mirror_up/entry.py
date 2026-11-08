@@ -80,6 +80,7 @@ class MirrorUP:
             self.index,
             flusher=flusher,
             log=self.server.logger,
+            local_server=self.server,
         )
 
     def _build_agent(self) -> Optional[AgentServer]:

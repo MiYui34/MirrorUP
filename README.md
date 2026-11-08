@@ -56,13 +56,36 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `sync.clean_mcc_orphans` | `true` | 删除不再被任何 region 引用的 `.mcc` 外置 chunk |
 | `log.history_keep` | `20` | `!!mu history` 保留多少轮 |
 | `source_flush.enabled` | `true` | 扫描前 `save-off` + `save-all flush`，扫描后 `save-on`；`transport=agent` 时自动关闭 |
-| `mirror_control.adapter` | `manual` | `manual` 只检查；`rcon` / `external` 可自动停启镜像 |
+| `mirror_control.adapter` | `manual` | `manual` 只检查；`rcon` / `external` / `mcsm` 自动停启；`self` 控制本 MCDR 自己的服（就地同步） |
 | `mirror_control.rcon` | `127.0.0.1:25575` | RCON 停服参数 |
 | `mirror_control.external` | 空 | `stop_cmd` / `start_cmd` / `probe_cmd` 自定义命令 |
 | `mirror_control.mcsm` | 空 | MCSManager 面板：`base_url`、`apikey`（v9）或 `username`/`password`（v10）、`uuid`、`remote_uuid` |
 | `mirror_control.start_after_sync` | `true` | 同步后自动启动镜像并等端口就绪 |
 | `agent_server` | `127.0.0.1:25580` | exporter 的监听地址、token 与 TLS 证书 |
 | `schedule.interval_seconds` | `3600` | 自动同步间隔，60 ~ 604800 秒 |
+
+## 就地同步：命令在哪个服敲，就同步哪个服
+
+想把插件**装到每一台服**上、玩家站在哪台服敲 `!!mu sync` 就同步哪台服，用 `self` 适配器：
+
+- **主服**：`role: "exporter"`，只读地对外提供世界（`agent_server` + token）。
+- **镜像服**：`role: "driver"`，`source.transport: "agent"` 指向主服，`targets` 只留一个指向自己：
+
+```json
+"targets": [
+  { "name": "self", "root": "./server",
+    "mirror_control": { "adapter": "self", "notify_players_sec": 10 } }
+]
+```
+
+`adapter: "self"` 的意思就是“目标是我这个 MCDR 管的服务器”。有变更时插件会：
+
+1. 在服里广播停服提示（`notify_players_sec` 秒，0 表示不提示）；
+2. 调 `server.stop()` 停掉本服——**MCDR 不会退出**；
+3. 等 `session.lock` 释放，再写入差异；
+4. `server.start()` 把本服拉起来，并等它重新可连。
+
+停的是服务端而不是 MCDR，所以同步线程不会被一起停掉。没变更时这四步一步都不做，只是 stat 一遍。
 
 ## 跨机同步（可选）
 
@@ -103,7 +126,7 @@ exporter 只读：它不写任何东西，也不执行同步命令。`!!mu statu
 
 ## 注意事项
 
-- **镜像必须完全停止才能同步**。默认 `manual` 适配器用 `session.lock` 判断；`rcon` / `external` 可以自动停服——但停不下来时会中止同步，绝不在镜像还活着时写盘。
+- **镜像必须完全停止才能同步**。默认 `manual` 适配器用 `session.lock` 判断；`rcon` / `external` 可以自动停服；`self`（就地同步）会自己停本服再拉起——但停不下来时会中止同步，绝不在镜像还活着时写盘。
 - **不做备份**。镜像上被覆盖的区块和模组没有历史版本。
 - **写入量不等于读取量**。`.mca` 默认 `inplace`，改动一个 chunk 时目标端只写这个 chunk 加 16KB（新头 + journal）；`rebuild` 模式才会重写整个 region。
 - **不覆盖配置文件**。`config/`、`server.properties` 不在默认同步范围内，手动加进去会覆盖镜像的配置。
@@ -123,7 +146,7 @@ exporter 只读：它不写任何东西，也不执行同步命令。`!!mu statu
 
 ## 版本
 
-当前 `0.5.0`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、`.mcc` 外置 chunk 增量与孤儿清理、多镜像目标（共享索引）、校验与同步历史、MCSM/rcon/external 自动停服、Python API。
+当前 `0.6.0`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、`.mcc` 外置 chunk 增量与孤儿清理、多镜像目标（共享索引）、校验与同步历史、MCSM/rcon/external 自动停服、**就地同步（`adapter: "self"`：命令在哪台服敲就停/写/启哪台服）**、Python API。
 
 ## 许可证
 

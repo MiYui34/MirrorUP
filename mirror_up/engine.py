@@ -216,12 +216,14 @@ class SyncEngine:
         index: Index,
         flusher=None,
         log: Optional[logging.Logger] = None,
+        local_server=None,
     ):
         self.config = config
         self.base_dir = Path(base_dir)
         self.index = index
         self.flusher = flusher or NullSourceFlusher()
         self.logger = log or logger
+        self.local_server = local_server
 
         self._run_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -385,6 +387,7 @@ class SyncEngine:
                 control = build_mirror_control(
                     self.config.control_for(self._target_by_name(tr.name)),
                     [c.target for c in contexts],
+                    server=self.local_server,
                 )
                 self._controls[tr.name] = control
             self._set_state(SyncState.STOPPING)

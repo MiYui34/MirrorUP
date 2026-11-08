@@ -221,6 +221,101 @@ class ManualMirrorControl(MirrorControl):
         return True, f"已确认镜像未运行（检查了 {len(locks)} 个 session.lock）"
 
 
+class SelfMirrorControl(MirrorControl):
+    """控制「插件自己所在的那个 Minecraft 服务器」。
+
+    和 rcon/external 的区别：这里不要端口、密码或外部命令，直接调用 MCDR 的
+    ``ServerInterface``。它用于就地同步：镜像服自己也装了 MirrorUP，玩家在镜像上
+    敲 ``!!mu sync`` 时，插件先停本服、写好世界、再拉起来。``server.stop()`` 只停
+    服务端，MCDR 本身会继续运行，所以同步线程不会被一起停掉。
+    """
+
+    name = "self"
+
+    def __init__(self, server: Any, target_roots: Iterable[Path], max_depth: int = 2):
+        super().__init__(target_roots, max_depth)
+        self.server = server
+
+    # -- 探测 ----------------------------------------------------------- #
+
+    def _server_running(self) -> bool:
+        if self.server is None:
+            return bool(self._locks_busy())
+        try:
+            return bool(self.server.is_server_running())
+        except Exception:  # 状态读不到就退回文件锁判断
+            logger.debug("[MirrorUP] 读取本服运行状态失败", exc_info=True)
+            return bool(self._locks_busy())
+
+    def check(self) -> Tuple[bool, str]:
+        if self.server is None:
+            if self._locks_busy():
+                return False, "没有拿到 server 对象，且 session.lock 被占用"
+            return True, "未发现 session.lock，视为本服未运行"
+        if self._server_running():
+            return False, "本服正在运行（插件所在服务器），将先停止它再写入"
+        busy = self._locks_busy()
+        if busy:
+            shown = ", ".join(str(p) for p in busy[:3])
+            return False, f"本服进程已退出，但 session.lock 仍被占用：{shown}"
+        return True, "本服已停止，可以写入"
+
+    def can_manage(self) -> bool:
+        return self.server is not None
+
+    # -- 启停 ----------------------------------------------------------- #
+
+    def stop(self, timeout: float, notify_sec: int = 0) -> Tuple[bool, str]:
+        if self.server is None:
+            return False, "没有 server 对象，无法自动停止本服"
+        if not self._server_running():
+            return self._wait_locks_free(min(timeout, 10.0)), "本服本来就处于停止状态"
+        if notify_sec > 0:
+            self._notify(notify_sec)
+        try:
+            sent = bool(self.server.stop())
+        except Exception as exc:
+            return False, f"调用 server.stop() 失败：{exc}"
+        if not sent:
+            return False, "server.stop() 返回 False（服务器可能正在停止或未就绪）"
+        if not self._poll(lambda: not self._server_running(), timeout):
+            return False, f"{timeout:.0f}s 内本服没有退出"
+        self._wait_locks_free(min(timeout, 10.0))
+        return True, "本服已停止"
+
+    def start(self) -> Tuple[bool, str]:
+        if self.server is None:
+            return False, "没有 server 对象，无法自动启动本服"
+        if self._server_running():
+            return True, "本服已在运行"
+        try:
+            started = bool(self.server.start())
+        except Exception as exc:
+            return False, f"调用 server.start() 失败：{exc}"
+        if not started:
+            return False, "server.start() 返回 False（可能已在启动，或 MCDR 状态不允许）"
+        return True, "已发送启动命令"
+
+    def wait_ready(self, timeout: float) -> bool:
+        if self.server is None:
+            return False
+        return self._poll(self._server_running, timeout)
+
+    # -- 内部 ----------------------------------------------------------- #
+
+    def _notify(self, seconds: int) -> None:
+        text = f"[MirrorUP] 本服将在 {seconds} 秒后停止以同步世界，稍后自动重启"
+        try:
+            say = getattr(self.server, "say", None)
+            if callable(say):
+                say(text)
+            else:
+                self.server.execute(f"say {text}")
+        except Exception:
+            logger.debug("[MirrorUP] 广播停服提示失败", exc_info=True)
+        time.sleep(min(max(int(seconds), 0), 30))
+
+
 class RconMirrorControl(ManualMirrorControl):
     """RCON 停服 + 可选命令启动。"""
 
@@ -545,10 +640,14 @@ class McsmMirrorControl(MirrorControl):
 
 
 def build_mirror_control(
-    control: MirrorControlConfig, target_roots: Iterable[Path]
+    control: MirrorControlConfig,
+    target_roots: Iterable[Path],
+    server: Any = None,
 ) -> MirrorControl:
     roots = [Path(p) for p in target_roots]
     adapter = (control.adapter or "manual").lower()
+    if adapter == "self":
+        return SelfMirrorControl(server, roots)
     if adapter == "rcon":
         return RconMirrorControl(roots, control.rcon, control.external.start_cmd)
     if adapter == "external":
