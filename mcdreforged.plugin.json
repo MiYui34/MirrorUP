@@ -1,0 +1,15 @@
+{
+  "id": "mirror_up",
+  "version": "0.2.0",
+  "name": "MirrorUP",
+  "description": "Incremental mirror sync: only changed files and changed region chunks are transferred",
+  "author": [
+    "MirrorUP"
+  ],
+  "dependencies": {
+    "mcdreforged": ">=2.12.0"
+  },
+  "requirements": [
+    "xxhash>=3.0"
+  ]
+}
