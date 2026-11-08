@@ -998,9 +998,9 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | `smoke_region.py` | region 首次构建、未变零读、只改一个 chunk、增删 chunk、坏文件/外置 chunk、rebuild 与 inplace 两种引擎路径、journal 恢复、compaction |
 | `smoke_commands.py` | 命令树注册、参数解析、渲染、`entry` 导入与包级导出 |
 | `smoke_v04.py` | wire 编解码、`AgentSource` 与 `LocalSource` 等价、跨机只写脏 chunk、`.mcc` 外置 chunk、external / rcon 适配器、配置 v4 校验 |
-| `smoke_v05.py` | 双目标各自独立计划与恢复、同步历史、浅/深校验（含"同大小同 mtime 改内容"）、`mirror_up.api`、exporter 拒绝同步、set 改名复用索引、孤儿 `.mcc` 清理、MCSM 适配器（假面板双鉴权）、随机化往返（manifest 300 / region 头 200 组 / chunk state 30 组） |
+| `smoke_v05.py` | 双目标各自独立计划与恢复、同步历史、浅/深校验（含"同大小同 mtime 改内容"）、`mirror_up.api`、exporter 拒绝同步、set 改名复用索引、孤儿 `.mcc` 清理、MCSM 适配器（假面板双鉴权）、随机化往返（manifest 300 / region 头 200 组 / chunk state 30 组）、fuzz（随机字节喂 `parse_header` / `scan_region`，只允许已知异常）、与 `robocopy /MIR` 的差分（文件集合 + 逐字节内容） |
 
-属性测试 / fuzz / 差分测试仍只有"随机化往返"这一层，没有接 Hypothesis，也没有与 `robocopy` 做差分。
+属性测试没有接 Hypothesis，用固定种子的随机往返代替；差分测试依赖 Windows 的 `robocopy`，没有该命令时自动跳过。
 
 ---
 
