@@ -25,8 +25,7 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 from .config import SyncConfig
-from .constants import IO_CHUNK, PENDING_BUSY, PENDING_UNSTABLE, PENDING_VANISHED
-from .hashing import new_hasher
+from .constants import PENDING_BUSY, PENDING_UNSTABLE, PENDING_VANISHED
 from .planner import Op, OpKind
 from .region import (
     RegionExternalChunk,
@@ -35,20 +34,12 @@ from .region import (
     decode_state,
     encode_state,
     logical_digest,
-    scan_region,
     write_region_delta,
     write_region_inplace,
 )
+from .source import LocalSource, Source, SourceError, SourceVanished, UnstableSource
 
 logger = logging.getLogger("mirror_up")
-
-
-class UnstableSource(Exception):
-    """源文件在读取期间被改写。"""
-
-
-class SourceVanished(Exception):
-    """源文件在读取前/期间消失。"""
 
 
 class TargetRetryable(Exception):
@@ -103,23 +94,29 @@ _RETRYABLE_ERRNOS = {
 
 
 class Applier:
-    """单个 set 的写入器。"""
+    """单个 set 的写入器。源可以是本地目录，也可以是跨机 agent。"""
 
     def __init__(
         self,
         set_name: str,
-        source_root: Path,
         target_root: Path,
         sync: SyncConfig,
+        source: Optional[Source] = None,
+        source_root: Optional[Path] = None,
         sleep: Callable[[float], None] = time.sleep,
         journal_dir: Optional[Path] = None,
     ):
         self.set_name = set_name
-        self.source_root = Path(source_root)
         self.target_root = Path(target_root)
         self.sync = sync
         self._sleep = sleep
         self.journal_dir = Path(journal_dir) if journal_dir is not None else None
+        if source is None:
+            if source_root is None:
+                raise ValueError("Applier 需要 source 或 source_root")
+            source = LocalSource(source_root, set_name)
+        self.source = source
+        self.source_root = getattr(source, "root", None)
 
     # ------------------------------------------------------------------ #
     # 入口
@@ -144,7 +141,6 @@ class Applier:
     # ------------------------------------------------------------------ #
 
     def _write_region(self, op: Op) -> ApplyResult:
-        src = _safe_join(self.source_root, op.path)
         dst = _safe_join(self.target_root, op.path)
         previous = decode_state(op.region_state)
         attempts = max(1, self.sync.max_retry)
@@ -153,7 +149,7 @@ class Applier:
 
         for attempt in range(1, attempts + 1):
             try:
-                scan = scan_region(src, dirty_since=op.dirty_since, previous=previous)
+                scan = self.source.scan_region(op.path, op.dirty_since, previous)
                 logical = logical_digest(scan.chunks)
 
                 if (
@@ -172,6 +168,7 @@ class Applier:
                         region_state=encode_state(scan.digests()),
                     )
 
+                get_record = self._record_getter(op.path, scan)
                 if self.sync.region_write_mode == "inplace":
                     result = write_region_inplace(
                         scan,
@@ -181,6 +178,7 @@ class Applier:
                         compaction_ratio=self.sync.region_compaction_ratio,
                         journal_dir=self.journal_dir,
                         rel_path=op.path,
+                        get_record=get_record,
                     )
                 else:
                     result = write_region_delta(
@@ -188,6 +186,7 @@ class Applier:
                         dst,
                         previous=previous,
                         force_full=op.force_write,
+                        get_record=get_record,
                     )
                 return ApplyResult(
                     op=op,
@@ -222,6 +221,12 @@ class Applier:
                 if attempt < attempts:
                     self._sleep(0.2 * attempt)
                     continue
+            except SourceError as exc:
+                last_detail = f"{type(exc).__name__}: {exc}"
+                pending_reason = PENDING_UNSTABLE
+                if attempt < attempts:
+                    self._sleep(0.2 * attempt)
+                    continue
             except OSError as exc:
                 if exc.errno in _RETRYABLE_ERRNOS and attempt < attempts:
                     last_detail = f"{type(exc).__name__}: {exc}"
@@ -247,7 +252,6 @@ class Applier:
     # ------------------------------------------------------------------ #
 
     def _write(self, op: Op) -> ApplyResult:
-        src = _safe_join(self.source_root, op.path)
         dst = _safe_join(self.target_root, op.path)
         last_detail = ""
         pending_reason = PENDING_UNSTABLE
@@ -256,7 +260,9 @@ class Applier:
         for attempt in range(1, attempts + 1):
             tmp: Optional[Path] = None
             try:
-                tmp, digest, size, mtime_ns = self._copy_to_temp(src, dst)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dst.parent / f".{dst.name}.mirrorup-{secrets.token_hex(4)}.tmp"
+                digest, size, mtime_ns = self.source.copy_to(op.path, tmp)
 
                 # 内容与索引一致、且目标本身没被改过：不写目标，只更新索引元数据
                 if not op.force_write and op.old_hash is not None and digest == op.old_hash:
@@ -301,6 +307,13 @@ class Applier:
                 if attempt < attempts:
                     self._sleep(0.2 * attempt)
                     continue
+            except SourceError as exc:
+                last_detail = f"{type(exc).__name__}: {exc}"
+                pending_reason = PENDING_UNSTABLE
+                self._unlink_quiet(tmp)
+                if attempt < attempts:
+                    self._sleep(0.2 * attempt)
+                    continue
             except OSError as exc:
                 self._unlink_quiet(tmp)
                 if exc.errno in _RETRYABLE_ERRNOS and attempt < attempts:
@@ -319,53 +332,23 @@ class Applier:
             )
         return ApplyResult(op=op, status="failed", detail=last_detail or "重试耗尽")
 
-    def _copy_to_temp(self, src: Path, dst: Path) -> Tuple[Path, bytes, int, int]:
-        try:
-            st0 = os.stat(src)
-        except FileNotFoundError as exc:
-            raise SourceVanished() from exc
+    def _record_getter(
+        self, rel: str, scan
+    ) -> Optional[Callable[[int], Tuple[int, bytes, bytes]]]:
+        """跨机源：region writer 需要按 chunk 拉记录时，返回一个取数回调。
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.parent / f".{dst.name}.mirrorup-{secrets.token_hex(4)}.tmp"
-        hasher = new_hasher()
-        written = 0
-
-        try:
-            with open(src, "rb") as fin, open(tmp, "wb") as fout:
-                while True:
-                    try:
-                        block = fin.read(IO_CHUNK)
-                    except OSError as exc:
-                        raise SourceVanished(f"读取源文件失败：{exc}") from exc
-                    if not block:
-                        break
-                    hasher.update(block)
-                    fout.write(block)
-                    written += len(block)
-                fout.flush()
-                os.fsync(fout.fileno())
-        except BaseException:
-            self._unlink_quiet(tmp)
-            raise
-
-        try:
-            st1 = os.stat(src)
-        except FileNotFoundError as exc:
-            self._unlink_quiet(tmp)
-            raise SourceVanished() from exc
-
-        if (
-            written != st0.st_size
-            or st1.st_size != st0.st_size
-            or st1.st_mtime_ns != st0.st_mtime_ns
-        ):
-            self._unlink_quiet(tmp)
-            raise UnstableSource(
-                f"源文件在读取期间被改写（{st0.st_size}B@{st0.st_mtime_ns} → "
-                f"{st1.st_size}B@{st1.st_mtime_ns}，实际读 {written}B）"
-            )
-
-        return tmp, hasher.digest(), written, st1.st_mtime_ns
+        本地源不需要（writer 会自己读源文件），返回 None 即可。
+        一次拉一批比每个 chunk 一个请求快得多；超过 256 个就退化成按需单取。
+        """
+        if not getattr(self.source, "is_remote", False):
+            return None
+        indices = sorted(scan.chunks)
+        if not indices:
+            return None
+        if len(indices) <= 256:
+            records = self.source.get_records(rel, indices)
+            return lambda index: records[index]
+        return lambda index: self.source.get_records(rel, [index])[index]
 
     @staticmethod
     def _unlink_quiet(path: Optional[Path]) -> None:

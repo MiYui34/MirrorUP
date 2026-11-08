@@ -1,8 +1,8 @@
 {
   "id": "mirror_up",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "name": "MirrorUP",
-  "description": "Incremental mirror sync: only changed files and changed region chunks are transferred",
+  "description": "Incremental mirror sync for MCDR: changed files, region chunks and external chunks only; optional cross-machine agent and auto stop/start",
   "author": [
     "MiYui34"
   ],

@@ -16,6 +16,7 @@ from typing import List, Optional
 
 from mcdreforged.api.all import CommandSource, RColor, RText, RTextList, PluginServerInterface
 
+from .agent import AgentError, AgentServer
 from . import commands
 from .config import (
     Config,
@@ -51,7 +52,9 @@ class MirrorUP:
             self.server.logger.warning("[%s] %s", APP_NAME, message)
 
         self.index = Index(self.data_dir / INDEX_FILENAME)
-        self.engine = self._build_engine()
+        self.is_exporter = self.config.role == "exporter"
+        self.engine = None if self.is_exporter else self._build_engine()
+        self.agent: Optional[AgentServer] = self._build_agent() if self.is_exporter else None
 
         self._sync_thread: Optional[threading.Thread] = None
         self._scheduler_thread: Optional[threading.Thread] = None
@@ -76,11 +79,31 @@ class MirrorUP:
             log=self.server.logger,
         )
 
+    def _build_agent(self) -> Optional[AgentServer]:
+        agent = AgentServer(self.config, self.base_dir)
+        try:
+            agent.validate()
+        except AgentError as exc:
+            self.server.logger.error("[%s] exporter 无法启动：%s", APP_NAME, exc)
+            return None
+        return agent
+
     # ------------------------------------------------------------------ #
     # 生命周期
     # ------------------------------------------------------------------ #
 
     def start_background(self) -> None:
+        if self.is_exporter:
+            if self.agent is None:
+                return
+            try:
+                self.agent.start(background=True)
+            except AgentError as exc:
+                self.server.logger.error("[%s] agent 启动失败：%s", APP_NAME, exc)
+                return
+            self.server.logger.info("[%s] exporter 已监听 %s", APP_NAME, self.agent.url)
+            return
+
         self._stop.clear()
         self._reschedule()
         self._scheduler_thread = threading.Thread(
@@ -94,7 +117,13 @@ class MirrorUP:
         thread = self._scheduler_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=5.0)
-        self.engine.cancel()
+        if self.engine is not None:
+            self.engine.cancel()
+        if self.agent is not None:
+            try:
+                self.agent.stop()
+            except Exception:  # pragma: no cover
+                pass
         try:
             self.index.close()
         except Exception:  # pragma: no cover
@@ -149,6 +178,12 @@ class MirrorUP:
         full: bool = False,
         force: bool = False,
     ) -> None:
+        if self.is_exporter or self.engine is None:
+            self._reply(
+                source,
+                RText(f"[{APP_NAME}] 当前是 exporter 节点，不执行同步（同步请到 driver 上操作）", RColor.yellow),
+            )
+            return
         if self.engine.is_busy() or (self._sync_thread is not None and self._sync_thread.is_alive()):
             self._reply(source, RText(f"[{APP_NAME}] 已有同步正在进行", RColor.yellow))
             return
@@ -171,6 +206,9 @@ class MirrorUP:
         force: bool,
         trigger: str,
     ) -> None:
+        if self.engine is None:
+            self._reply(source, RText(f"[{APP_NAME}] 当前是 exporter 节点，不执行同步", RColor.yellow))
+            return
         started = time.time()
         try:
             report = self.engine.run(dry_run=dry_run, full=full, force=force, trigger=trigger)
@@ -207,7 +245,17 @@ class MirrorUP:
 
     def status_lines(self) -> List[str]:
         lines = [f"{APP_NAME} v{self.version}（{self.config.role}）"]
-        lines.extend(self.engine.describe())
+        if self.is_exporter:
+            if self.agent is not None and self.agent.url:
+                lines.append(f"agent：监听中 {self.agent.url}")
+            else:
+                lines.append("agent：未启动（检查 agent_server.token / tls 配置）")
+            sets = ", ".join(s.name for s in self.config.enabled_sets()) or "无"
+            lines.append(f"对外提供：{sets}")
+            lines.append(f"配置：{self.config.path}")
+            return lines
+        if self.engine is not None:
+            lines.extend(self.engine.describe())
         if self.config.schedule.auto_sync:
             remaining = max(0, int(self._next_due - time.time()))
             lines.append(
@@ -229,7 +277,23 @@ class MirrorUP:
             return RText(f"[{APP_NAME}] 配置重载失败：{exc}", RColor.red)
 
         self.config = config
-        self.engine = self._build_engine()
+        self.is_exporter = config.role == "exporter"
+        if self.agent is not None:
+            try:
+                self.agent.stop()
+            except Exception:  # pragma: no cover
+                pass
+            self.agent = None
+        if self.is_exporter:
+            self.engine = None
+            self.agent = self._build_agent()
+            if self.agent is not None:
+                try:
+                    self.agent.start(background=True)
+                except AgentError as exc:
+                    self.server.logger.error("[%s] agent 启动失败：%s", APP_NAME, exc)
+        else:
+            self.engine = self._build_engine()
         self._reschedule()
         self._wake.set()
         for message in warnings:

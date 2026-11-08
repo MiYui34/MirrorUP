@@ -22,17 +22,18 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import secrets
 import shutil
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, Optional, Set, Tuple
 
 from .constants import REGION_NAME_RE
-from .hashing import new_hasher
+from .hashing import new_hasher, region_coords
 
 SECTOR_SIZE = 4096
 HEADER_SECTORS = 2
@@ -50,7 +51,7 @@ class RegionFormatError(Exception):
 
 
 class RegionExternalChunk(RegionFormatError):
-    """包含外置（``.mcc``）chunk，v0.2 不处理，降级整文件复制。"""
+    """外置（``.mcc``）chunk 无法处理——例如 ``.mcc`` 文件缺失或路径不可解析。"""
 
 
 class RegionUnstable(Exception):
@@ -80,6 +81,10 @@ class ChunkDelta:
     timestamp: int
     digest: Optional[bytes] = None
     read: bool = False
+    #: 数据在 ``.mcc`` 外置容器里（region 内只有 5 字节占位记录）
+    external: bool = False
+    #: ``.mcc`` 文件相对 set 根的路径（POSIX 风格）
+    external_rel: Optional[str] = None
 
     def as_slot(self) -> Slot:
         return Slot(self.index, self.offset, self.sectors, self.timestamp)
@@ -87,12 +92,15 @@ class ChunkDelta:
 
 @dataclass
 class RegionScan:
-    path: Path
+    #: 本地扫描时是源文件路径；跨机扫描（agent）时为 ``None``
+    path: Optional[Path]
     size: int
     mtime_ns: int
     header: bytes
     chunks: Dict[int, ChunkDelta]
     dirty: Set[int]
+    #: 本轮实际读过的外置 chunk 文件（相对 set 根），供上层判断依赖
+    external_files: Set[str] = field(default_factory=set)
 
     def digests(self) -> Dict[int, bytes]:
         out: Dict[int, bytes] = {}
@@ -170,15 +178,68 @@ def _is_dirty(timestamp: int, since: Optional[int], prev_known: bool) -> bool:
     return timestamp >= since
 
 
+def external_chunk_rel(region_path: os.PathLike[str] | str, index: int) -> str:
+    """``r.X.Z.mca`` 里第 ``index`` 个 chunk 对应的 ``.mcc`` 文件名。
+
+    chunk 坐标是全局的：``cx = X*32 + index % 32``、``cz = Z*32 + index // 32``。
+    """
+    name = Path(region_path).name
+    coords = region_coords(name)
+    if coords is None:
+        raise RegionExternalChunk(f"无法从文件名解析 region 坐标：{name}")
+    rx, rz = coords
+    cx = rx * 32 + (index % 32)
+    cz = rz * 32 + (index // 32)
+    return f"c.{cx}.{cz}.mcc"
+
+
+def _external_digest(
+    region_path: Path,
+    index: int,
+    set_root: Optional[os.PathLike[str] | str],
+) -> Tuple[bytes, str, int]:
+    """外置 chunk 的身份 = H(5B 占位记录 || H(.mcc 内容))。
+
+    占位记录进哈希是必须的：否则两个内容相同的 ``.mcc`` 会被当成同一个 chunk，
+    而它们的压缩类型/长度字段可能不同。
+    """
+    if set_root is None:
+        raise RegionExternalChunk("外置 chunk 需要 set 根目录才能定位 .mcc")
+    rel_in_region = external_chunk_rel(region_path, index)
+    root = Path(set_root)
+    try:
+        region_dir = region_path.parent.relative_to(root)
+    except ValueError as exc:
+        raise RegionExternalChunk(f"region 不在 set 根内：{region_path}") from exc
+    rel = (region_dir / rel_in_region).as_posix()
+    mcc_path = root / region_dir / rel_in_region
+
+    hasher = new_hasher()
+    total = 0
+    with open(mcc_path, "rb") as fp:
+        while True:
+            block = fp.read(1 << 20)
+            if not block:
+                break
+            hasher.update(block)
+            total += len(block)
+    return hasher.digest(), rel, total
+
+
 def scan_region(
     path: os.PathLike[str] | str,
     dirty_since: Optional[int] = None,
     previous: Optional[Dict[int, bytes]] = None,
+    set_root: Optional[os.PathLike[str] | str] = None,
 ) -> RegionScan:
     """扫描一个 region，只读取“可能需要”的 chunk。
 
     ``dirty_since`` 是上一轮同步开始的 Unix 秒；时间戳早于它的 chunk 视为未变，
     直接沿用 ``previous`` 里的哈希（因此稳态下源端只读 8KB 头）。
+
+    外置（``.mcc``）chunk 只读占位记录和外部文件的内容哈希；它们的字节不在
+    region 里，真正搬运由普通文件同步完成（镜像服在同步期间是停的，先后顺序
+    不影响结果）。
     """
     previous = previous or {}
     p = Path(path)
@@ -188,6 +249,7 @@ def scan_region(
 
     chunks: Dict[int, ChunkDelta] = {}
     dirty: Set[int] = set()
+    external_files: Set[str] = set()
 
     with open(p, "rb") as fp:
         header = fp.read(HEADER_SIZE)
@@ -203,11 +265,15 @@ def scan_region(
             if _is_dirty(slot.timestamp, dirty_since, prev is not None):
                 _length, head, body = read_record(fp, slot)
                 if head[4] & EXTERNAL_FLAG:
-                    raise RegionExternalChunk(
-                        f"chunk {index} 使用外置 .mcc 容器，降级为整文件复制"
-                    )
-                chunk.digest = record_digest(head, body)
-                chunk.read = True
+                    digest, rel, _size = _external_digest(p, index, set_root)
+                    chunk.digest = record_digest(head, digest)
+                    chunk.read = True
+                    chunk.external = True
+                    chunk.external_rel = rel
+                    external_files.add(rel)
+                else:
+                    chunk.digest = record_digest(head, body)
+                    chunk.read = True
                 dirty.add(index)
             else:
                 chunk.digest = prev
@@ -230,6 +296,7 @@ def scan_region(
         header=header,
         chunks=chunks,
         dirty=dirty,
+        external_files=external_files,
     )
 
 
@@ -307,11 +374,36 @@ def build_header(entries: Dict[int, Tuple[int, int, int]]) -> bytes:
     return bytes(locations) + bytes(timestamps)
 
 
+def _read_chunk_payload(reader, fin, scan, chunk: ChunkDelta) -> Tuple[int, bytes, bytes, bytes]:
+    """取一条 chunk 的 ``(length, head, body, digest)``。
+
+    ``reader`` 非空时按 index 从外部取（跨机模式：HTTP 批量拉取）；否则从源
+    region 文件读。外置 chunk 只能信扫描阶段算出的哈希（它的字节不在 region 里）。
+    """
+    if reader is not None:
+        length, head, body = reader(chunk.index)
+    else:
+        if fin is None:
+            raise RegionFormatError(f"chunk {chunk.index} 没有可用的数据来源")
+        length, head, body = read_record(fin, chunk.as_slot())
+
+    if chunk.external:
+        if chunk.digest is None:
+            raise RegionExternalChunk(f"chunk {chunk.index} 缺少外置内容哈希")
+        return length, head, body, chunk.digest
+
+    digest = record_digest(head, body)
+    if chunk.digest is not None and chunk.digest != digest:
+        raise RegionUnstable(f"chunk {chunk.index} 在扫描与写入之间被改写")
+    return length, head, body, digest
+
+
 def write_region_delta(
     scan: RegionScan,
     dst_path: os.PathLike[str] | str,
     previous: Optional[Dict[int, bytes]] = None,
     force_full: bool = False,
+    get_record: Optional[Callable[[int], Tuple[int, bytes, bytes]]] = None,
 ) -> RegionWriteResult:
     """把 ``scan`` 描述的内容落到目标，复用目标里未变的 chunk 字节。
 
@@ -320,7 +412,6 @@ def write_region_delta(
     最后回填 8KB 头并原子替换。整个过程中目标文件本身从未被写过。
     """
     previous = previous or {}
-    src = scan.path
     dst = Path(dst_path)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.parent / f".{dst.name}.mirrorup-{secrets.token_hex(4)}.tmp"
@@ -354,7 +445,13 @@ def write_region_delta(
         reused = 0
         end_sector = max(HEADER_SECTORS, (os.path.getsize(tmp) + SECTOR_SIZE - 1) // SECTOR_SIZE)
 
-        with open(tmp, "r+b") as fout, open(src, "rb") as fin:
+        with contextlib.ExitStack() as stack:
+            fout = stack.enter_context(open(tmp, "r+b"))
+            fin = None
+            if get_record is None:
+                if scan.path is None:
+                    raise RegionFormatError("region 扫描结果没有本地路径，且未提供 chunk 读取器")
+                fin = stack.enter_context(open(scan.path, "rb"))
             fout.seek(0, os.SEEK_END)
 
             for index in sorted(scan.chunks):
@@ -376,8 +473,7 @@ def write_region_delta(
                     continue
 
                 # 需要从源端搬这条记录
-                length, head, body = read_record(fin, chunk.as_slot())
-                digest = chunk.digest if chunk.digest is not None else record_digest(head, body)
+                length, head, body, digest = _read_chunk_payload(get_record, fin, scan, chunk)
                 need = (4 + length + SECTOR_SIZE - 1) // SECTOR_SIZE
                 if need > MAX_SECTORS:
                     raise RegionFormatError(f"chunk {index} 记录过大：{length}B")
@@ -602,6 +698,7 @@ def write_region_inplace(
     compaction_ratio: float = 0.5,
     journal_dir: Optional[os.PathLike[str] | str] = None,
     rel_path: str = "",
+    get_record: Optional[Callable[[int], Tuple[int, bytes, bytes]]] = None,
 ) -> RegionWriteResult:
     """直接改目标文件：旧 chunk 原地保留，新 chunk 追加到末尾，最后提交 8KB 头。
 
@@ -623,7 +720,7 @@ def write_region_inplace(
         recover_journal_at(journal_dir, rel_path, dst)
 
     if force_full or not dst.exists():
-        return write_region_delta(scan, dst, previous, force_full=True)
+        return write_region_delta(scan, dst, previous, force_full=True, get_record=get_record)
 
     try:
         with open(dst, "rb") as fp:
@@ -633,14 +730,14 @@ def write_region_inplace(
             origin_header = fp.read(HEADER_SIZE)
         origin = parse_header(origin_header, size)
     except (OSError, RegionFormatError):
-        return write_region_delta(scan, dst, previous, force_full=True)
+        return write_region_delta(scan, dst, previous, force_full=True, get_record=get_record)
 
     _cleanup_tmp(dst)
 
     total_sectors = (size + SECTOR_SIZE - 1) // SECTOR_SIZE
     live_sectors = HEADER_SECTORS + sum(slot.sectors for slot in origin.values())
     if total_sectors > live_sectors * (1.0 + max(0.0, float(compaction_ratio))):
-        result = write_region_delta(scan, dst, previous, force_full=True)
+        result = write_region_delta(scan, dst, previous, force_full=True, get_record=get_record)
         result.compacted = True
         return result
 
@@ -649,7 +746,13 @@ def write_region_inplace(
     written = 0
     end_sector = (size + SECTOR_SIZE - 1) // SECTOR_SIZE
 
-    with open(dst, "r+b") as fout, open(scan.path, "rb") as fin:
+    with contextlib.ExitStack() as stack:
+        fout = stack.enter_context(open(dst, "r+b"))
+        fin = None
+        if get_record is None:
+            if scan.path is None:
+                raise RegionFormatError("region 扫描结果没有本地路径，且未提供 chunk 读取器")
+            fin = stack.enter_context(open(scan.path, "rb"))
         for index in sorted(scan.chunks):
             chunk = scan.chunks[index]
             prev = previous.get(index)
@@ -669,10 +772,7 @@ def write_region_inplace(
 
             # 需要从源端搬这条记录：校验“扫描时算的哈希 == 现在读到的字节”，
             # 防止扫描与写入之间源端又改了一次，把不一致的内容写进镜像。
-            length, head, body = read_record(fin, chunk.as_slot())
-            digest = record_digest(head, body)
-            if chunk.digest is not None and chunk.digest != digest:
-                raise RegionUnstable(f"chunk {index} 在扫描与写入之间被改写：{scan.path}")
+            length, head, body, digest = _read_chunk_payload(get_record, fin, scan, chunk)
             need = (4 + length + SECTOR_SIZE - 1) // SECTOR_SIZE
             if need > MAX_SECTORS:
                 raise RegionFormatError(f"chunk {index} 记录过大：{length}B")

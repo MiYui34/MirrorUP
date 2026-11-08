@@ -39,11 +39,19 @@ from .excludes import GlobMatcher
 from .flush import NullSourceFlusher
 from .hashing import is_region_name
 from .index import KIND_DIR, KIND_FILE, FileRow, Index, WorldIdMismatch
-from .leveldat import read_level_info
+from .leveldat import LevelInfo, read_level_info, read_level_info_bytes
 from .mirror_ctl import build_mirror_control
 from .planner import Op, OpKind, Plan, SetPlan, build_set_plan
 from .region import recover_all_journals, supports_delta
 from .scanner import ScanResult, ScannedEntry, scan_tree
+from .source import (
+    LocalSource,
+    Source,
+    SourceError,
+    SourceUnavailable,
+    SourceVanished,
+    build_source,
+)
 
 logger = logging.getLogger("mirror_up")
 
@@ -73,10 +81,11 @@ class SyncState:
 class SetContext:
     cfg: SetConfig
     set_id: int
-    source: Path
+    source: Optional[Path]
     target: Path
     index_rows: Dict[str, FileRow]
     applier: Applier
+    src: Optional[Source] = None
     plan: Optional[SetPlan] = None
 
 
@@ -150,7 +159,8 @@ class SyncEngine:
         self._last_progress_log = 0.0
 
         roots = [set_target_path(config, s, self.base_dir) for s in config.enabled_sets()]
-        self.mirror_control = build_mirror_control(config.mirror_control.adapter, roots)
+        self.mirror_control = build_mirror_control(config.mirror_control, roots)
+        self._contexts: List[SetContext] = []
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -190,6 +200,7 @@ class SyncEngine:
         )
         self._cancel.clear()
         self._last_progress_log = 0.0
+        self._contexts = []
         self._set_state(SyncState.PREPARING)
 
         try:
@@ -204,6 +215,7 @@ class SyncEngine:
             self.logger.exception("[MirrorUP] 同步失败")
         finally:
             self._close_flush_window()
+            self._close_sources()
             report.finished_at = time.time()
             report.state = self.state
             self._set_state(SyncState.IDLE if report.ok() else report.state)
@@ -225,7 +237,16 @@ class SyncEngine:
         scans: Dict[str, ScanResult] = {}
         try:
             for ctx in contexts:
-                scans[ctx.cfg.name] = scan_tree(ctx.source, self._matcher)
+                if ctx.src is None:
+                    continue
+                try:
+                    scans[ctx.cfg.name] = ctx.src.scan(self._matcher)
+                except SourceVanished:
+                    report.warnings.append(
+                        f"set {ctx.cfg.name!r} 在源端不存在（agent 上没有这个 set），本轮跳过"
+                    )
+        except SourceUnavailable as exc:
+            raise SyncAborted(f"源端不可用：{exc}")
         finally:
             if not dry_run:
                 self._close_flush_window()
@@ -250,16 +271,64 @@ class SyncEngine:
             self.logger.info("[MirrorUP] 没有需要同步的变更")
         else:
             self._set_state(SyncState.STOPPING)
-            stopped, message = self.mirror_control.check()
-            if not stopped:
-                raise SyncAborted(message)
-            self.logger.info("[MirrorUP] %s", message)
+            self._ensure_mirror_stopped(report)
             self._apply(contexts, plan, report, snapshot_ns)
-            report.hint = "目标已更新完毕；镜像服仍是停止状态，确认后请手动启动"
+            self._restart_mirror(report)
 
         self._set_state(SyncState.COMMITTING)
         self._commit_meta(report, snapshot_ns)
         self._set_state(SyncState.IDLE)
+
+    # ------------------------------------------------------------------ #
+    # 镜像启停
+    # ------------------------------------------------------------------ #
+
+    def _ensure_mirror_stopped(self, report: RoundReport) -> None:
+        ctl = self.mirror_control
+        stopped, message = ctl.check()
+        if stopped:
+            self.logger.info("[MirrorUP] %s", message)
+            return
+        if not ctl.can_manage():
+            raise SyncAborted(message)
+
+        cfg = self.config.mirror_control
+        self.logger.warning("[MirrorUP] %s；尝试自动停服（%s 适配器）", message, ctl.name)
+        ok, detail = ctl.stop(cfg.stop_timeout_sec, cfg.notify_players_sec)
+        if not ok:
+            raise SyncAborted(f"自动停服失败：{detail}")
+        report.warnings.append(f"已自动停止镜像服（{detail}）")
+
+    def _restart_mirror(self, report: RoundReport) -> None:
+        cfg = self.config.mirror_control
+        ctl = self.mirror_control
+        if not (cfg.start_after_sync and ctl.can_manage()):
+            report.hint = "目标已更新完毕；镜像服仍是停止状态，确认后请手动启动"
+            return
+
+        ok, detail = ctl.start()
+        if not ok:
+            report.warnings.append(f"同步完成，但自动启动失败：{detail}")
+            report.hint = "目标已更新完毕；镜像服仍处于停止状态，请手动启动"
+            return
+
+        if ctl.wait_ready(cfg.wait_ready_timeout_sec):
+            report.hint = f"目标已更新完毕，镜像服已启动（{detail}）"
+        else:
+            report.warnings.append("镜像服启动后未确认就绪，请检查控制台")
+            report.hint = (
+                f"目标已更新完毕，已执行启动命令（{detail}），"
+                f"但 {cfg.wait_ready_timeout_sec:.0f}s 内未确认就绪"
+            )
+
+    def _close_sources(self) -> None:
+        for ctx in self._contexts:
+            if ctx.src is not None:
+                try:
+                    ctx.src.close()
+                except Exception:  # 关闭失败不影响结果
+                    logger.debug("[MirrorUP] 关闭源失败", exc_info=True)
+        self._contexts = []
 
     # ------------------------------------------------------------------ #
     # 准备
@@ -267,14 +336,21 @@ class SyncEngine:
 
     def _prepare(self, report: RoundReport, repair: bool = True) -> List[SetContext]:
         contexts: List[SetContext] = []
+        agent_mode = (self.config.source.transport or "local").lower() == "agent"
         for item in self.config.enabled_sets():
-            src = set_source_path(self.config, item, self.base_dir)
+            src_path = set_source_path(self.config, item, self.base_dir)
             dst = set_target_path(self.config, item, self.base_dir)
-            if not src.exists():
-                report.warnings.append(f"set {item.name!r} 的源目录不存在，本轮跳过：{src}")
-                continue
-            if not src.is_dir():
-                report.warnings.append(f"set {item.name!r} 的源不是目录，本轮跳过：{src}")
+            if not agent_mode:
+                if not src_path.exists():
+                    report.warnings.append(f"set {item.name!r} 的源目录不存在，本轮跳过：{src_path}")
+                    continue
+                if not src_path.is_dir():
+                    report.warnings.append(f"set {item.name!r} 的源不是目录，本轮跳过：{src_path}")
+                    continue
+            try:
+                src = build_source(self.config, item, self.base_dir)
+            except SourceError as exc:
+                report.warnings.append(f"set {item.name!r} 的源无法使用，本轮跳过：{exc}")
                 continue
             set_id = self.index.upsert_set(item.name, item.source, item.target)
             rows = self.index.load_files(set_id)
@@ -292,19 +368,20 @@ class SyncEngine:
                     )
             applier = Applier(
                 set_name=item.name,
-                source_root=src.resolve(),
                 target_root=dst.resolve(),
                 sync=self.config.sync,
+                source=src,
                 journal_dir=journal_dir,
             )
             contexts.append(
                 SetContext(
                     cfg=item,
                     set_id=set_id,
-                    source=src.resolve(),
+                    source=None if agent_mode else src_path.resolve(),
                     target=dst.resolve(),
                     index_rows=rows,
                     applier=applier,
+                    src=src,
                 )
             )
 
@@ -321,13 +398,14 @@ class SyncEngine:
             raise SyncAborted(str(exc)) from exc
 
         self._check_version_gate(contexts, report)
+        self._contexts = contexts
         return contexts
 
     def _compute_world_id(self, contexts: Sequence[SetContext]) -> str:
         """world_id 由源根 + 世界版本/种子构成，用于识别“索引套错了世界”。"""
         parts = [str(source_root(self.config, self.base_dir))]
         for ctx in contexts:
-            info = read_level_info(ctx.source / "level.dat")
+            info = self._level_info(ctx)
             if info is not None:
                 parts.extend(
                     [
@@ -340,10 +418,22 @@ class SyncEngine:
         digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
         return digest
 
+    def _level_info(self, ctx: SetContext) -> Optional[LevelInfo]:
+        """源端 level.dat 的版本/种子；跨机时通过 agent 读字节。"""
+        if ctx.src is None:
+            return None
+        try:
+            data = ctx.src.read_bytes("level.dat")
+        except (SourceError, OSError):
+            return None
+        if not data:
+            return None
+        return read_level_info_bytes(data)
+
     def _check_version_gate(self, contexts: Sequence[SetContext], report: RoundReport) -> None:
         """源与镜像的 MC 版本不一致时拒绝写入（可用 force 覆盖）。"""
         for ctx in contexts:
-            src_info = read_level_info(ctx.source / "level.dat")
+            src_info = self._level_info(ctx)
             if src_info is None or src_info.version_name is None:
                 continue
             dst_info = read_level_info(ctx.target / "level.dat")
@@ -377,7 +467,9 @@ class SyncEngine:
         last_sync_begin_ns = self.index.get_meta_int("last_sync_begin", 0)
         dirty_since = last_sync_begin_ns // 1_000_000_000 if last_sync_begin_ns else None
         for ctx in contexts:
-            scan = scans[ctx.cfg.name]
+            scan = scans.get(ctx.cfg.name)
+            if scan is None:
+                continue
             report.scan_errors += len(scan.errors)
             report.pruned_dirs += scan.pruned_dirs
             for path, message in scan.errors[:5]:
@@ -489,18 +581,17 @@ class SyncEngine:
                     if ctx.plan is None:
                         continue
                     for op in ctx.plan.ops:
-                        futures[pool.submit(ctx.applier.apply, op)] = ctx
+                        futures[pool.submit(ctx.applier.apply, op)] = (ctx, op)
 
                 for future in as_completed(futures):
-                    ctx = futures[future]
+                    ctx, op = futures[future]
                     if future.cancelled():
                         continue
                     try:
                         result = future.result()
                     except Exception as exc:  # 单文件异常不能拖垮整轮
-                        op = getattr(future, "mirrorup_op", None)
                         result = ApplyResult(
-                            op=op,  # type: ignore[arg-type]
+                            op=op,
                             status="failed",
                             detail=f"{type(exc).__name__}: {exc}",
                         )

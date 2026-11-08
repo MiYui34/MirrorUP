@@ -185,7 +185,7 @@ MirrorUP 是一个 MCDR 插件，负责把主服（source）的世界与模组�
 
 | 模块 | 职责 | 可独立测试 |
 |---|---|---|
-| `transport` | 抽象：`scan() / stat() / read_at() / list_manifest()` | ✓ 用本地实现做基准 |
+| `source` | 抽象：`scan() / stat() / copy_to() / scan_region() / get_records() / read_bytes()` | ✓ 用本地实现做基准 |
 | `scanner` | 遍历 set，产出 snapshot | ✓ |
 | `hasher` | 文件哈希、chunk 表计算 | ✓ |
 | `region` | 头解析、chunk 记录定位与哈希、文件重建/补丁 | ✓ 重点 fuzz |
@@ -639,16 +639,20 @@ MirrorMcsmcdR 在调用同步**之前**就执行了 `save-on`（`auto_save_on` �
 ### 12.1 抽象接口
 
 ```python
-class Transport(Protocol):
-    def info(self) -> Info: ...                       # 协议版本、world_id、mc_version、mods_digest
-    def manifest(self, set_id: int, since: int) -> Manifest: ...
-    def stat(self, set_id: int, path: str) -> StatEntry: ...
-    def read_at(self, set_id: int, path: str, off: int, length: int) -> bytes: ...
-    def region_meta(self, set_id: int, path: str) -> RegionMeta: ...
-    def region_chunks(self, set_id: int, path: str, bitmap: bytes) -> list[ChunkRecord]: ...
+class Source(Protocol):                # v0.4 实际接口（原计划的 Transport 收敛成它）
+    is_remote: bool
+    def scan(self, matcher) -> ScanResult: ...              # 全量路径集合 + (size, mtime_ns)
+    def stat(self, rel: str) -> Optional[tuple[int, int]]: ...
+    def copy_to(self, rel: str, dst: Path) -> tuple[bytes, int, int]: ...   # 流式落盘，边写边哈希
+    def scan_region(self, rel: str, dirty_since, previous) -> RegionScan: ...
+    def get_records(self, rel: str, indices) -> dict[int, tuple[int, bytes, bytes]]: ...
+    def read_bytes(self, rel: str, limit: int = 8 << 20) -> Optional[bytes]: ...
+    def close(self) -> None: ...
 ```
 
-`local` 与 `agent` 两个实现，上层逻辑完全一致。
+`local` 与 `agent` 两个实现，上层（planner / applier / engine）完全一致。
+
+**为什么没有按 offset 读的 `read_at`？** 写入端需要的是"某个 chunk 的完整记录"，而不是任意字节区间。整文件 + 按 chunk 索引取记录，比在 HTTP 上做 Range 请求少一层边界处理，也天然复用同一套 `read_record` 校验。代价是新增文件必须整文件传——这本来就是必需的量。
 
 ### 12.2 `local`
 
@@ -664,16 +668,16 @@ class Transport(Protocol):
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/v1/info` | 协议版本、world_id、mc 版本、模组摘要 |
-| GET | `/v1/manifest?set=<id>&since=<ts>` | 二进制 manifest，含全量路径集合 |
-| GET | `/v1/file?set=&path=` | 整文件（用于新增文件） |
-| GET | `/v1/stat?set=&path=` | `(size, mtime_ns, hash)`，用于读后校验 |
-| GET | `/v1/region?set=&path=` | 8KB 头 + 1024×8B chunk 哈希表 |
-| POST | `/v1/region/chunks?set=&path=` | body = 128B 位图；返回所选 chunk 记录 |
+| GET | `/v1/info` | 协议版本、版本号、set 列表与各自 mc 版本 |
+| GET | `/v1/manifest?set=<name>` | 二进制 manifest，含全量路径集合 |
+| GET | `/v1/file?set=&path=` | 整文件流式下载（新增/修改文件） |
+| GET | `/v1/stat?set=&path=` | JSON `{size, mtime_ns, is_dir}`，用于读后校验 |
+| GET | `/v1/region?set=&path=&since=<unix秒>` | region 摘要：8KB 头 + 脏 chunk 的 `(index, timestamp, digest)` |
+| GET / POST | `/v1/region/chunks?set=&path=&idx=a,b,c` | 指定 chunk 的记录（`length + 5B 头 + payload`） |
 
-**为什么 manifest 要带全量路径集合？** 因为删除检测需要它。只发增量的话，客户端无法发现"源端删了文件"。路径名本身很便宜：20 万条路径经前缀压缩 + gzip 约 1–2MB，一次 LAN 传输可忽略。
+**为什么 manifest 要带全量路径集合？** 因为删除检测需要它。只发增量的话，客户端无法发现"源端删了文件"。路径名本身很便宜：20 万条路径经 varint 前缀压缩后约 1–2MB，一次 LAN 传输可忽略。
 
-二进制 manifest 格式（小端，gzip 外层）：
+二进制 manifest 格式（大端，v0.4 实现）：
 
 ```
 "MUPM" | u8 version | u32 count
@@ -683,39 +687,59 @@ repeat count times, 按路径字典序：
   suffix bytes
   u64 size
   i64 mtime_ns
-  u8  flags        # bit0=hash 存在, bit1=region, bit2=被延后
-  [16B hash]
+  u8  kind         # 0 = 文件, 1 = 目录
 ```
+
+设计稿里的 gzip 外层与 hash 字段没有实现：manifest 在 LAN/本机场景下已经够小，hash 属于索引层、不进 manifest（驱动端本来就要按需重算）。差异记在 §12.5。
 
 ### 12.4 认证与安全
 
-- `Authorization: Bearer <token>`，token 长度 ≥ 32，比较用 `hmac.compare_digest`。
+- `Authorization: Bearer <token>`，比较用 `hmac.compare_digest`；token 少于 16 字符直接拒绝启动 agent（少于 32 字符告警）。
 - 默认监听 `127.0.0.1:25580`；跨机需显式改 `host`。
-- 可选 TLS（自签证书 + 指纹固定 `tls_pin_sha256`）。
+- 可选 TLS（自签证书 + 指纹固定 `tls_pin_sha256`，比对的是证书 DER 的 SHA-256）。
 - 服务端校验：set 必须已配置、路径规范化后必须落在 set root 内、拒绝符号链接逃逸。
 - 建议部署在 WireGuard / 内网，TLS 作为二层防护。
 - **源端 agent 不提供任何写接口**，即使 token 泄露也无法修改主服。
+
+### 12.5 v0.4 实现记录（与上文规范的差异）
+
+1. **`Transport` 收敛为 `Source`**：没有 `read_at` / `region_meta` / `region_chunks(bitmap)`，改成 `scan / copy_to / scan_region / get_records`。理由见 §12.1。
+2. **manifest 不压缩、不带 hash**；`flags` 简化成 `kind`（只有文件/目录两种）。
+3. **chunk 选择用 `idx` 列表而不是 128B 位图**：驱动端每轮最多要几十到几百个 chunk，列表比位图省事；单次上限 1024。
+4. **`/v1/region` 带 `since`**：服务端只对 `timestamp >= since` 的 chunk 算哈希，其余返回 `has_digest=0`，由客户端用上一轮索引补齐——这是跨机场景下"不读整个世界"的关键。
+5. **`.mcc` 外置 chunk**：region 里只有 5 字节占位记录。逻辑哈希定义为 `H(占位记录 || H(mcc 内容))`，`H(mcc)` 由 `scan_region` 顺带算出并随摘要下发；驱动端把它当普通 chunk 搬 5 字节占位，真正内容由普通文件同步搬运（镜像停机期间，先后顺序无影响）。
+6. **TLS**：`agent_server.tls.enabled` 时用 `ssl.SSLContext(PROTOCOL_TLS_SERVER)` 包一层；驱动端 `tls_pin_sha256` 对 `getpeercert(True)` 的 DER 做 SHA-256 后比对，证书链本身不校验（自签场景）。
+7. **鉴权**：token ≥16 才允许启动 agent；设计稿写 ≥32，实现放宽并给出告警，方便本地联调。
+8. **客户端连接**：每条请求新建 `http.client` 连接（`Connection: close`）。同步是批处理，连接复用带来的收益远小于状态管理成本；将来做长连接也不影响协议。
 
 ---
 
 ## 13. 镜像服启停编排
 
 ```python
-class MirrorControl(Protocol):
-    def is_stopped(self) -> bool: ...
-    def stop(self, timeout: float) -> bool: ...
-    def start(self) -> bool: ...
+class MirrorControl(Protocol):         # v0.4 实际接口
+    def check(self) -> tuple[bool, str]: ...        # (已停止?, 说明)
+    def can_manage(self) -> bool: ...               # 能不能自己停/启
+    def stop(self, timeout: float, notify_sec: int = 0) -> tuple[bool, str]: ...
+    def start(self) -> tuple[bool, str]: ...
     def wait_ready(self, timeout: float) -> bool: ...
 ```
 
 | 适配器 | 说明 | 版本 |
 |---|---|---|
-| `manual` | 只检查，不操作；未停止则中止同步并提示 | v0.1 |
-| `rcon` | RCON `stop` + TCP 端口探活 + 可选 `subprocess` 启动 | v0.2 |
-| `mcsm` | 调用 MCSM API | v0.4（按需） |
-| `external` | 调用用户提供的命令钩子（`stop_cmd` / `start_cmd` / `probe_cmd`） | v0.2 |
+| `manual` | 只检查，不操作；未停止则中止同步并提示 | v0.1（v0.4 仍是默认） |
+| `rcon` | RCON `stop`（可选先 `say` 倒计时）+ TCP 端口探活 + 可选 `start_cmd` 启动 | v0.4 |
+| `mcsm` | 调用 MCSM API | 未实现，配置了也按 `manual` 处理并告警 |
+| `external` | 调用用户提供的命令钩子（`stop_cmd` / `start_cmd` / `probe_cmd`） | v0.4 |
 
 `external` 是万能兜底：用户写一个 shell 脚本就能接任何面板。
+
+**实现细节（v0.4）**：
+
+- 判断"正在运行"有三条独立证据：`session.lock` 被占用（`msvcrt.locking` / `fcntl.lockf` 试锁）、RCON 端口可连、`probe_cmd` 退出码为 0。任一为真即视为运行中——宁可多等一次，也不要在镜像还活着时改它的存档。
+- `rcon` 的启动命令复用 `mirror_control.external.start_cmd`（RCON 只能停不能启）。
+- `stop` 之后轮询到进程真的退出才返回；超时返回失败，同步中止（不会在镜像还在跑的时候写文件）。
+- `start_after_sync=true` 时，同步完自动 `start()` 并 `wait_ready()`；只是"已执行"还是"已确认就绪"会写进 `report.hint`，不会假装成功。
 
 ---
 
@@ -725,7 +749,7 @@ class MirrorControl(Protocol):
 
 ```jsonc
 {
-  "schema_version": 1,
+  "schema_version": 4,
   "role": "driver",                      // driver | exporter
 
   "source": {
@@ -821,6 +845,9 @@ class MirrorControl(Protocol):
 - `sets[].target` 重名 → 拒绝启动。
 - `region_write_mode=inplace` 从 v0.3 起可用且是默认；`journal=false` 时自动降级为 `rebuild` 并告警（没有头快照的 inplace 不提供崩溃保护）；`region_compaction_ratio < 0` 视为 0（只受"不缩小文件"限制，有碎片就整理）。`region_delta` 从 v0.2 起真正生效（v0.1 打开只会告警并忽略）。
 - 跨机时 `agent.url` 指向自身地址 → 拒绝（防止自我同步）。
+- `source.transport` 只能是 `local` / `agent`，其他值直接 `ConfigError`；`agent` 模式下 `agent.url` 必须是 http(s)，不再检查本地 `source.root` 是否存在（那是 exporter 的事）。
+- `role=exporter` 时 `agent_server.token` 少于 16 字符 → 拒绝启动 agent；少于 32 字符 → 告警。
+- `mirror_control.adapter=rcon` 但 `rcon.password` 为空 → 告警（RCON 通常会拒绝登录）；`adapter=external` 缺 `stop_cmd` 或 `start_cmd` → 告警；`adapter=mcsm` → 告警「v0.4 未实现，按 manual 处理」。
 
 ---
 
@@ -950,10 +977,10 @@ class MirrorControl(Protocol):
 | 版本 | 范围 | 验收标准 |
 |---|---|---|
 | **v0.1** ✅ | 索引 + 文件级增量 + 读后复验（§10.1）+ 原子替换 + plan/dry-run + 排除清单 + 断点续传 + `manual` 适配器 | Profile B 稳态一轮 < 10 s；崩溃注入不产生损坏文件 |
-| **v0.2** 🚧 | region chunk 级增量（`rebuild`，已完成）+ chunk 读—复验（已完成）+ 定时（已完成）；`.mcc` 增量、RCON/external 启停**未做** | Profile B 稳态一轮 < 5 s；源端读取量下降一个数量级（目标端写入量不变，见 §8.6 第 2 条） |
-| **v0.3** ✅ | `inplace` append-and-commit + compaction + 头 journal（§8.7）；`.mcc` 增量、RCON/external 启停仍在 v0.4 | 写量降到"脏 chunk + 16KB"，崩溃注入后靠 journal 恢复旧头 |
-| **v0.4** | 跨机 `agent` 传输 + TLS + 多镜像目标 | 同机/跨机结果一致；断网重连续传 |
-| **v0.5** | `verify`、同步历史、`!!mu status` 增强、Python API 对外开放 | 第三方插件可调用 |
+| **v0.2** ✅ | region chunk 级增量（`rebuild`）+ chunk 读—复验 + 定时 | Profile B 稳态一轮 < 5 s；源端读取量下降一个数量级（目标端写入量不变，见 §8.6 第 2 条） |
+| **v0.3** ✅ | `inplace` append-and-commit + compaction + 头 journal（§8.7） | 写量降到"脏 chunk + 16KB"，崩溃注入后靠 journal 恢复旧头 |
+| **v0.4** ✅ | 跨机 `agent` 传输 + TLS + `rcon`/`external` 停服 + `.mcc` 外置 chunk 增量 + 配置 schema v4 | 同机/跨机结果一致；`.mcc` 改内容能触发同步；停止不了镜像时拒绝写盘 |
+| **v0.5** | `verify`、同步历史、`!!mu status` 增强、多镜像目标共享索引、Python API 对外开放 | 第三方插件可调用 |
 | 可选 | btrfs/zfs snapshot 加速后端、空闲触发、WebUI | — |
 
 ---

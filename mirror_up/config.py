@@ -185,6 +185,21 @@ class ScheduleConfig:
 
 
 @dataclass
+class TlsConfig:
+    enabled: bool = False
+    cert: str = ""
+    key: str = ""
+
+
+@dataclass
+class AgentServerConfig:
+    host: str = "127.0.0.1"
+    port: int = 25580
+    token: str = ""
+    tls: TlsConfig = field(default_factory=TlsConfig)
+
+
+@dataclass
 class LogConfig:
     history_keep: int = 20
     verbose_plan: bool = False
@@ -202,6 +217,7 @@ class Config:
     source_flush: SourceFlushConfig = field(default_factory=SourceFlushConfig)
     mirror_control: MirrorControlConfig = field(default_factory=MirrorControlConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
+    agent_server: AgentServerConfig = field(default_factory=AgentServerConfig)
     log: LogConfig = field(default_factory=LogConfig)
 
     #: 配置文件自身位置，便于 reload 与报错定位。
@@ -301,6 +317,8 @@ def parse_config(raw: Dict[str, Any]) -> Config:
     flush_raw = _as_dict(raw.get("source_flush"))
     control_raw = _as_dict(raw.get("mirror_control"))
     schedule_raw = _as_dict(raw.get("schedule"))
+    agent_server_raw = _as_dict(raw.get("agent_server"))
+    agent_tls_raw = _as_dict(agent_server_raw.get("tls"))
     log_raw = _as_dict(raw.get("log"))
 
     sets_raw = raw.get("sets")
@@ -380,6 +398,16 @@ def parse_config(raw: Dict[str, Any]) -> Config:
             interval_seconds=max(60, _as_int(schedule_raw.get("interval_seconds"), 3600)),
             max_interval_seconds=max_interval,
             skip_if_source_empty=_as_bool(schedule_raw.get("skip_if_source_empty"), False),
+        ),
+        agent_server=AgentServerConfig(
+            host=_as_str(agent_server_raw.get("host"), "127.0.0.1"),
+            port=max(0, min(65535, _as_int(agent_server_raw.get("port"), 25580))),
+            token=_as_str(agent_server_raw.get("token"), ""),
+            tls=TlsConfig(
+                enabled=_as_bool(agent_tls_raw.get("enabled"), False),
+                cert=_as_str(agent_tls_raw.get("cert"), ""),
+                key=_as_str(agent_tls_raw.get("key"), ""),
+            ),
         ),
         log=LogConfig(
             history_keep=max(1, _as_int(log_raw.get("history_keep"), 20)),
@@ -526,12 +554,27 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
     dst = target_root(cfg, base)
     if _is_within(src, dst) or _is_within(dst, src):
         raise ConfigError(f"source.root 与 target.root 不能互相包含：{src} / {dst}")
+    if cfg.source.transport not in ("local", "agent"):
+        raise ConfigError(f"source.transport 只能是 local / agent，当前为 {cfg.source.transport!r}")
     if cfg.source.transport == "agent":
-        raise ConfigError("source.transport=agent 属于 v0.4 内容，当前版本只支持 local")
-    if not src.exists():
+        url = (cfg.source.agent.url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            raise ConfigError(f"source.agent.url 必须是 http(s) 地址，当前为 {url!r}")
+        if len(cfg.source.agent.token or "") < 16:
+            warnings.append(
+                "source.transport=agent 但 source.agent.token 少于 16 个字符；"
+                "agent 端会拒绝这种 token，请两边填同一个随机串"
+            )
+        if url.lower().startswith("http://") and not cfg.source.agent.tls_pin_sha256:
+            warnings.append(
+                "agent 走的是明文 HTTP；跨机部署建议上 TLS（https + tls_pin_sha256）"
+            )
+    if not src.exists() and cfg.source.transport == "local":
         # 不当成致命错误：路径可能还没建好，玩家也可能改完配置再 !!mu reload。
         # 真正执行同步时，_prepare 会因为“没有任何可用的 set”而中止。
         warnings.append(f"source.root 不存在：{src}（同步会中止，改好后 !!mu reload）")
+    elif cfg.source.transport == "agent":
+        warnings.append(f"源端为 agent（{cfg.source.agent.url}），不同步本地 {src}")
 
     names = set()
     targets = set()
@@ -546,6 +589,8 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
 
     for item in cfg.enabled_sets():
         set_src = set_source_path(cfg, item, base)
+        if cfg.source.transport == "agent":
+            continue
         if not set_src.exists():
             warnings.append(f"set {item.name!r} 的源目录不存在，本轮跳过：{set_src}")
         elif not set_src.is_dir():
@@ -556,10 +601,21 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
 
     if cfg.mirror_control.adapter not in ("manual", "rcon", "external", "mcsm"):
         raise ConfigError(f"未知的 mirror_control.adapter：{cfg.mirror_control.adapter!r}")
-    if cfg.mirror_control.adapter in ("rcon", "external", "mcsm"):
+    if cfg.mirror_control.adapter == "rcon":
+        if not cfg.mirror_control.rcon.password:
+            warnings.append("mirror_control.adapter=rcon 但 rcon.password 为空，停服命令会失败")
+    elif cfg.mirror_control.adapter == "external":
+        if not cfg.mirror_control.external.stop_cmd:
+            warnings.append("mirror_control.adapter=external 但 stop_cmd 为空，无法自动停镜像")
+        if not cfg.mirror_control.external.start_cmd and cfg.mirror_control.start_after_sync:
+            warnings.append("start_after_sync=true 但 external.start_cmd 为空，同步后不会自动启动")
+    elif cfg.mirror_control.adapter == "mcsm":
+        warnings.append("mirror_control.adapter=mcsm 尚未实现，当前按 manual 处理（只检查、不操作）")
+
+    if cfg.role == "exporter" and len(cfg.agent_server.token or "") < 16:
         warnings.append(
-            f"mirror_control.adapter={cfg.mirror_control.adapter} 属于 v0.2 内容，"
-            "当前版本按 manual 处理（只检查、不操作）"
+            "role=exporter 但 agent_server.token 少于 16 个字符，agent 不会启动；"
+            "请生成一个随机串（例如 python -c \"import secrets;print(secrets.token_hex(24))\"）"
         )
 
     return warnings
@@ -639,7 +695,16 @@ def config_to_dict(cfg: Config) -> Dict[str, Any]:
             "max_interval_seconds": cfg.schedule.max_interval_seconds,
             "skip_if_source_empty": cfg.schedule.skip_if_source_empty,
         },
-        "agent_server": dict(DEFAULT_CONFIG["agent_server"]),
+        "agent_server": {
+            "host": cfg.agent_server.host,
+            "port": cfg.agent_server.port,
+            "token": cfg.agent_server.token,
+            "tls": {
+                "enabled": cfg.agent_server.tls.enabled,
+                "cert": cfg.agent_server.tls.cert,
+                "key": cfg.agent_server.tls.key,
+            },
+        },
         "log": {
             "history_keep": cfg.log.history_keep,
             "verbose_plan": cfg.log.verbose_plan,

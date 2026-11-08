@@ -128,8 +128,8 @@ def render_report(report: RoundReport) -> RTextList:
     )
     if report.regions_delta:
         detail += (
-            f"\n  region 增量 {report.regions_delta} 个：写入 chunk {report.chunks_written}，"
-            f"复用 {report.chunks_reused}"
+            f"\n  region 增量 {report.regions_delta} 个：写入 {report.chunks_written} 个 chunk，"
+            f"复用 {report.chunks_reused} 个"
         )
     lines.append(_line(detail, RColor.gray))
     if report.cancelled:

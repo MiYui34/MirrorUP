@@ -11,7 +11,7 @@ MCDR 把「目录插件里与插件 id 同名的包」当作入口模块：插�
 从而认不出来（见 ``plugin_factory.__get_plugin_class_from_path``）。
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = ["__version__", "on_load", "on_unload"]
 

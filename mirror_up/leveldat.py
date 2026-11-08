@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -132,25 +133,29 @@ def _read_payload(reader: _Reader, tag_type: int) -> Any:
     raise NbtError(f"未知的 NBT tag 类型：{tag_type}")
 
 
+def parse_nbt_bytes(data: bytes) -> Dict[str, Any]:
+    """解析内存里的 NBT；跨机源只拿到字节流时用这个。"""
+    stream: BinaryIO
+    if data[:2] == _GZIP_MAGIC:
+        stream = gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb")
+    else:
+        stream = io.BytesIO(data)
+    try:
+        reader = _Reader(stream)
+        root_type = reader.u8()
+        if root_type != TAG_COMPOUND:
+            raise NbtError(f"根标签不是 compound（{root_type}）")
+        reader.string()  # 根名字，通常为空
+        return _read_payload(reader, TAG_COMPOUND)
+    except (OSError, EOFError, struct.error) as exc:
+        raise NbtError(f"读取 NBT 失败：{exc}") from exc
+
+
 def parse_nbt_file(path: Path) -> Dict[str, Any]:
     """解析根 compound；兼容 gzip 与未压缩两种 level.dat。"""
     with open(path, "rb") as raw:
-        magic = raw.read(2)
-        raw.seek(0)
-        stream: BinaryIO
-        if magic == _GZIP_MAGIC:
-            stream = gzip.GzipFile(fileobj=raw, mode="rb")
-        else:
-            stream = raw
-        try:
-            reader = _Reader(stream)
-            root_type = reader.u8()
-            if root_type != TAG_COMPOUND:
-                raise NbtError(f"根标签不是 compound（{root_type}）")
-            reader.string()  # 根名字，通常为空
-            return _read_payload(reader, TAG_COMPOUND)
-        except (OSError, EOFError, struct.error) as exc:
-            raise NbtError(f"读取 NBT 失败：{exc}") from exc
+        data = raw.read()
+    return parse_nbt_bytes(data)
 
 
 @dataclass
@@ -166,6 +171,18 @@ def read_level_info(level_dat: Path) -> Optional[LevelInfo]:
         root = parse_nbt_file(level_dat)
     except (OSError, NbtError):
         return None
+    return _level_info_from_root(root)
+
+
+def read_level_info_bytes(data: bytes) -> Optional[LevelInfo]:
+    try:
+        root = parse_nbt_bytes(data)
+    except NbtError:
+        return None
+    return _level_info_from_root(root)
+
+
+def _level_info_from_root(root: Dict[str, Any]) -> Optional[LevelInfo]:
     data = root.get("Data")
     if not isinstance(data, dict):
         return None
