@@ -619,6 +619,14 @@ def _normalize(cfg: Config) -> List[str]:
     if cfg.source.mtime_precision_sec and cfg.sync.trust_mtime:
         warnings.append("mtime_precision_sec > 0 时不建议信任 mtime，已自动关闭 trust_mtime")
         cfg.sync.trust_mtime = False
+    # 跨机时 driver 不在源服那台机器上，save-off/save-all 只会发给本机的镜像服，
+    # 既刷新不了源端，还会把镜像服的自动保存关掉——直接关掉这个窗口。
+    if (cfg.source.transport or "local").lower() == "agent" and cfg.source_flush.enabled:
+        cfg.source_flush.enabled = False
+        warnings.append(
+            "source.transport=agent 时 source_flush 不生效（save-off 只会发给本机），"
+            "已自动关闭；请确保 exporter 那台机器的世界已经落盘"
+        )
     return warnings
 
 

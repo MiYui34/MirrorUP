@@ -951,6 +951,10 @@ class SyncEngine:
     # ------------------------------------------------------------------ #
 
     def _open_flush_window(self, report: RoundReport) -> None:
+        if (self.config.source.transport or "local").lower() == "agent":
+            # 源端在另一台机器上，本机发的 save-off 只会打到镜像服。
+            self.logger.info("[MirrorUP] 跨机模式：跳过 save-off（无法从本机控制源端保存）")
+            return
         self._set_state(SyncState.FLUSHING)
         try:
             outcome = self.flusher.begin()

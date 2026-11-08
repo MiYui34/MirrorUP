@@ -55,7 +55,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `sync.journal` | `true` | `inplace` 的 region 头快照；`false` 会降级为 `rebuild` |
 | `sync.clean_mcc_orphans` | `true` | 删除不再被任何 region 引用的 `.mcc` 外置 chunk |
 | `log.history_keep` | `20` | `!!mu history` 保留多少轮 |
-| `source_flush.enabled` | `true` | 扫描前 `save-off` + `save-all flush`，扫描后 `save-on` |
+| `source_flush.enabled` | `true` | 扫描前 `save-off` + `save-all flush`，扫描后 `save-on`；`transport=agent` 时自动关闭 |
 | `mirror_control.adapter` | `manual` | `manual` 只检查；`rcon` / `external` 可自动停启镜像 |
 | `mirror_control.rcon` | `127.0.0.1:25575` | RCON 停服参数 |
 | `mirror_control.external` | 空 | `stop_cmd` / `start_cmd` / `probe_cmd` 自定义命令 |
@@ -80,6 +80,8 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 3. 公网部署请开 TLS（`agent_server.tls.enabled` + 证书），并在驱动端填 `tls_pin_sha256` 固定指纹。
 
 exporter 只读：它不写任何东西，也不执行同步命令。`!!mu status` 在 exporter 上显示监听地址与对外提供的 set。
+
+跨机时 `source_flush` 会被自动关闭（driver 不在源服那台机器上，`save-off` 只会发给本机镜像服）。请保证 exporter 侧的世界已经落盘：要么主服定期保存，要么同步前在主服执行一次 `save-all flush`。
 
 ## 命令
 
