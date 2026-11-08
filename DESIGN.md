@@ -970,6 +970,17 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 
 `verify --deep` 的实现：重新计算源端与目标端全部 chunk 哈希并逐一比对（不比对文件哈希，因为目标布局独立于源，见 §8.4）。
 
+**v0.4 实际落地的测试**（`tests/`，不进仓库，随源码分发时可另行提供）：
+
+| 脚本 | 覆盖 |
+|---|---|
+| `smoke_engine.py` | 10 个场景：dry-run、首轮、零写入、单文件变更、删除、空源保护与 `--force`、mtime 回退、还原嫌疑全量重算、镜像篡改重推、镜像变大后零写入 |
+| `smoke_region.py` | region 首次构建、未变零读、只改一个 chunk、增删 chunk、坏文件/外置 chunk、rebuild 与 inplace 两种引擎路径、journal 恢复、compaction |
+| `smoke_commands.py` | 命令树注册、参数解析、渲染、`entry` 导入与包级导出 |
+| `smoke_v04.py` | wire 编解码、`AgentSource` 与 `LocalSource` 等价、跨机只写脏 chunk、`.mcc` 外置 chunk、external / rcon 适配器、配置 v4 校验 |
+
+属性测试 / fuzz / 差分测试仍是计划项，没有实现；当前用真实 region 的小样本 + 手工注入覆盖。
+
 ---
 
 ## 20. 路线图
