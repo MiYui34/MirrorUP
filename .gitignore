@@ -21,3 +21,6 @@ venv/
 # 绯荤粺
 .DS_Store
 Thumbs.db
+
+# 测试（仅本地开发使用，不随仓库发布）
+tests/
