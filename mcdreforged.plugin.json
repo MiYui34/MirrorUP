@@ -4,8 +4,9 @@
   "name": "MirrorUP",
   "description": "Incremental mirror sync: only changed files and changed region chunks are transferred",
   "author": [
-    "MirrorUP"
+    "MiYui34"
   ],
+  "link": "https://github.com/MiYui34/MirrorUP",
   "dependencies": {
     "mcdreforged": ">=2.12.0"
   },
