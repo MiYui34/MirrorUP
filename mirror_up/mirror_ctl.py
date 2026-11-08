@@ -14,14 +14,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import ssl
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
-from .config import ExternalConfig, MirrorControlConfig, RconConfig
+from .config import ExternalConfig, McsmConfig, MirrorControlConfig, RconConfig
 from .rcon import RconClient, RconError
 
 logger = logging.getLogger("mirror_up")
@@ -360,6 +365,185 @@ class ExternalMirrorControl(MirrorControl):
         return self._poll(ready, timeout)
 
 
+class McsmError(Exception):
+    """MCSM API 调用失败。"""
+
+
+class _McsmClient:
+    """最小 MCSManager HTTP 客户端。
+
+    兼容两种鉴权：MCSM 9 的 ``apikey`` 查询参数，以及 MCSM 10 的登录 token
+    （``POST /api/auth/login`` → ``Authorization: Bearer``）。实例操作沿用
+    ``/api/protected_instance/*`` 端点。
+    """
+
+    def __init__(self, cfg: McsmConfig):
+        self.cfg = cfg
+        self.base_url = (cfg.base_url or "").rstrip("/")
+        self._token: Optional[str] = None
+
+    # -- 底层 ----------------------------------------------------------- #
+
+    def _url(self, path: str, params: Optional[dict] = None) -> str:
+        query = dict(params or {})
+        if self.cfg.apikey:
+            query.setdefault("apikey", self.cfg.apikey)
+        url = f"{self.base_url}{path}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        return url
+
+    def request(self, method: str, path: str, params: Optional[dict] = None, body: Optional[dict] = None) -> Any:
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(self._url(path, params), data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        if self._token:
+            req.add_header("Authorization", f"Bearer {self._token}")
+        context = ssl._create_unverified_context() if self.cfg.insecure_tls else None
+        try:
+            with urllib.request.urlopen(req, timeout=self.cfg.timeout_sec, context=context) as resp:
+                raw = resp.read()
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                pass
+            raise McsmError(f"HTTP {exc.code} {path} {detail}".strip()) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise McsmError(f"连接 {self.base_url} 失败：{exc}") from exc
+        if not raw:
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise McsmError(f"响应不是 JSON：{raw[:120]!r}") from exc
+
+    def login(self) -> None:
+        if self.cfg.apikey or self._token:
+            return
+        if not (self.cfg.username and self.cfg.password):
+            raise McsmError("未配置 apikey，也没有 username/password")
+        data = self.request(
+            "POST", "/api/auth/login", body={"username": self.cfg.username, "password": self.cfg.password}
+        )
+        token = None
+        if isinstance(data, dict):
+            token = data.get("token") or (data.get("data") or {}).get("token")
+        if not token:
+            raise McsmError("登录 MCSM 失败：响应里没有 token")
+        self._token = str(token)
+
+    # -- 语义 ----------------------------------------------------------- #
+
+    def _instance_params(self) -> dict:
+        return {"uuid": self.cfg.uuid, "remote_uuid": self.cfg.remote_uuid}
+
+    def status(self) -> Optional[int]:
+        """返回 0=已停止、1=运行中、2=启动中、3=停止中；判断不了返回 None。
+
+        MCSM 的响应是 ``{"status": 200, "data": 3}`` 这种信封格式，顶层的
+        ``status`` 是 HTTP 风格的状态码，**不是**实例状态——所以先看 ``data``。
+        """
+        data = self.request("GET", "/api/protected_instance/status", self._instance_params())
+        if not isinstance(data, dict):
+            return None
+        inner = data.get("data")
+        value: object = None
+        if isinstance(inner, dict):
+            value = inner.get("status")
+        elif isinstance(inner, (int, str)) and not isinstance(inner, bool):
+            value = inner
+        if value is None:
+            value = data.get("status")
+        text = str(value).strip() if value is not None else ""
+        if not text.isdigit():
+            return None
+        code = int(text)
+        # 200/400 这类是信封里的 HTTP 状态码，不能当实例状态用。
+        return code if code in (0, 1, 2, 3) else None
+
+    def stop(self) -> None:
+        self.request("POST", "/api/protected_instance/stop", self._instance_params())
+
+    def start(self) -> None:
+        self.request("POST", "/api/protected_instance/start", self._instance_params())
+
+
+class McsmMirrorControl(MirrorControl):
+    """通过 MCSManager 面板停/启实例。"""
+
+    name = "mcsm"
+
+    def __init__(self, target_roots: Iterable[Path], mcsm: McsmConfig, max_depth: int = 2):
+        super().__init__(target_roots, max_depth)
+        self.mcsm = mcsm
+        self._client: Optional[_McsmClient] = None
+
+    def can_manage(self) -> bool:
+        return True
+
+    def _api(self) -> _McsmClient:
+        if self._client is None:
+            client = _McsmClient(self.mcsm)
+            client.login()
+            self._client = client
+        return self._client
+
+    def _status(self) -> Optional[int]:
+        try:
+            return self._api().status()
+        except McsmError as exc:
+            logger.warning("[MirrorUP] MCSM 状态查询失败：%s", exc)
+            return None
+
+    def _running(self) -> Optional[bool]:
+        status = self._status()
+        if status is not None:
+            # 2=启动中、3=停止中，都算“还没停稳”，按运行中处理最安全。
+            return status != 0
+        if self._locks_busy():
+            return True
+        return None
+
+    def check(self) -> Tuple[bool, str]:
+        running = self._running()
+        if running is None:
+            return super().check()
+        if running:
+            return False, "镜像仍在运行（MCSM 实例状态为运行中）"
+        return True, "镜像未运行（MCSM 实例状态为已停止）"
+
+    def stop(self, timeout: float, notify_sec: int = 0) -> Tuple[bool, str]:
+        try:
+            client = self._api()
+        except McsmError as exc:
+            return False, f"MCSM 登录失败：{exc}"
+        try:
+            client.stop()
+        except McsmError as exc:
+            return False, f"MCSM 停服请求失败：{exc}"
+
+        def stopped() -> bool:
+            running = self._running()
+            return running is False
+
+        if self._poll(stopped, timeout):
+            return True, "已通过 MCSM 停止镜像服"
+        return False, f"MCSM 已发送停止请求，但 {timeout:.0f} 秒内实例仍在运行"
+
+    def start(self) -> Tuple[bool, str]:
+        try:
+            self._api().start()
+        except McsmError as exc:
+            return False, f"MCSM 启动请求失败：{exc}"
+        return True, "已通过 MCSM 启动镜像服"
+
+    def wait_ready(self, timeout: float) -> bool:
+        return self._poll(lambda: self._running() is True, timeout)
+
+
 def build_mirror_control(
     control: MirrorControlConfig, target_roots: Iterable[Path]
 ) -> MirrorControl:
@@ -369,5 +553,6 @@ def build_mirror_control(
         return RconMirrorControl(roots, control.rcon, control.external.start_cmd)
     if adapter == "external":
         return ExternalMirrorControl(roots, control.external)
-    # manual / mcsm（未实现）都退化为只检查
+    if adapter == "mcsm":
+        return McsmMirrorControl(roots, control.mcsm)
     return ManualMirrorControl(roots)

@@ -9,9 +9,11 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 - **镜像纠偏**：镜像上被玩家改过的文件，下一轮会被发现并恢复。
 - **原子写入**：先写临时文件再替换，镜像上不会出现半个文件；写入失败下一轮自动重试。
 - **原地写 region**：`.mca` 默认 append-and-commit + 8KB 头 journal，一个 chunk 变了就只写它；碎片攒多了自动整理。
-- **外置 chunk 也增量**：`.mcc` 外置容器的 region 只搬迁占位记录，内容变化按普通文件增量同步。
+- **外置 chunk 也增量**：`.mcc` 外置容器的 region 只搬迁占位记录，内容变化按普通文件增量同步；不再被任何 region 引用的 `.mcc` 会被清理（`sync.clean_mcc_orphans`）。
 - **跨机同步**：主服用 `exporter` 模式只读提供数据（HTTP + Bearer token，可上 TLS），镜像侧不用挂载主服目录。
-- **自动停服**：支持 `rcon` 与自定义命令（`external`）两种方式停/启镜像；停不下来就拒绝写入。
+- **自动停服**：支持 `rcon`、MCSManager（`mcsm`）与自定义命令（`external`）停/启镜像；停不下来就拒绝写入。
+- **多镜像目标**：一份源、多个镜像目录，共享一个索引（按目标分区），每个目标可以有自己的停服方式。
+- **校验与历史**：`!!mu verify` 核对源/镜像/索引三方是否一致（`--deep` 比哈希），`!!mu history` 查看每轮结果。
 - **定时同步**：间隔 60 秒 ~ 7 天，可随时开关。
 
 ## 安装
@@ -42,7 +44,8 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `source.agent.token` | 空 | 与 exporter 的 `agent_server.token` 一致 |
 | `source.agent.tls_pin_sha256` | 空 | 可选，固定自签证书指纹 |
 | `role` | `driver` | `driver` 执行同步；`exporter` 只对外提供数据 |
-| `target.root` | `./Mirror/server` | 镜像服目录 |
+| `target.root` | `./Mirror/server` | 镜像服目录（单目标时的简写；等价于 `targets[0]`） |
+| `targets` | 一个 `default` | 多镜像目标：`[{"name","root","enabled","mirror_control"?}]`，每个目标可覆盖停服配置 |
 | `sets` | `world`、`mods` | 同步哪些目录；`config/`、`server.properties` 默认不同步 |
 | `exclude` | `session.lock`、`*.tmp`、`logs/**` 等 | glob 排除，命中目录整棵跳过 |
 | `sync.concurrency` | `4` | 并行拷贝数 |
@@ -50,10 +53,13 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `sync.region_delta` | `true` | `.mca` 走 chunk 级增量，`false` 退回整文件 |
 | `sync.region_write_mode` | `inplace` | `inplace` 原地追加，`rebuild` 重建后替换 |
 | `sync.journal` | `true` | `inplace` 的 region 头快照；`false` 会降级为 `rebuild` |
+| `sync.clean_mcc_orphans` | `true` | 删除不再被任何 region 引用的 `.mcc` 外置 chunk |
+| `log.history_keep` | `20` | `!!mu history` 保留多少轮 |
 | `source_flush.enabled` | `true` | 扫描前 `save-off` + `save-all flush`，扫描后 `save-on` |
 | `mirror_control.adapter` | `manual` | `manual` 只检查；`rcon` / `external` 可自动停启镜像 |
 | `mirror_control.rcon` | `127.0.0.1:25575` | RCON 停服参数 |
 | `mirror_control.external` | 空 | `stop_cmd` / `start_cmd` / `probe_cmd` 自定义命令 |
+| `mirror_control.mcsm` | 空 | MCSManager 面板：`base_url`、`apikey`（v9）或 `username`/`password`（v10）、`uuid`、`remote_uuid` |
 | `mirror_control.start_after_sync` | `true` | 同步后自动启动镜像并等端口就绪 |
 | `agent_server` | `127.0.0.1:25580` | exporter 的监听地址、token 与 TLS 证书 |
 | `schedule.interval_seconds` | `3600` | 自动同步间隔，60 ~ 604800 秒 |
@@ -84,7 +90,9 @@ exporter 只读：它不写任何东西，也不执行同步命令。`!!mu statu
 | `!!mu sync --full` | 2 | 忽略索引，全量重算哈希 |
 | `!!mu sync --force` | 2 | 跳过安全检查（空源保护、版本门禁） |
 | `!!mu diff` | 2 | 同 `--dry-run` |
-| `!!mu status` | 0 | 索引规模、上次同步、待重试项 |
+| `!!mu status` | 0 | 索引规模、各目标上次同步、待重试项 |
+| `!!mu verify [--deep]` | 2 | 校验源/镜像/索引一致性；`--deep` 逐个比哈希（会读全部内容） |
+| `!!mu history [N]` | 0 | 最近 N 轮同步结果（默认 10，最多 50） |
 | `!!mu cancel` | 2 | 取消进行中的同步 |
 | `!!mu schedule on\|off` | 3 | 开关自动同步 |
 | `!!mu schedule set 30m` | 3 | 设置间隔（`s`/`m`/`h`/`d`） |
@@ -113,7 +121,7 @@ exporter 只读：它不写任何东西，也不执行同步命令。`!!mu statu
 
 ## 版本
 
-当前 `0.4.0`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、rcon/external 自动停服、`.mcc` 外置 chunk 增量。
+当前 `0.5.0`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、`.mcc` 外置 chunk 增量与孤儿清理、多镜像目标（共享索引）、校验与同步历史、MCSM/rcon/external 自动停服、Python API。
 
 ## 许可证
 

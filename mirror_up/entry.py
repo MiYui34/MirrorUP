@@ -17,6 +17,7 @@ from typing import List, Optional
 from mcdreforged.api.all import CommandSource, RColor, RText, RTextList, PluginServerInterface
 
 from .agent import AgentError, AgentServer
+from .api import MirrorUPAPI
 from . import commands
 from .config import (
     Config,
@@ -55,6 +56,8 @@ class MirrorUP:
         self.is_exporter = self.config.role == "exporter"
         self.engine = None if self.is_exporter else self._build_engine()
         self.agent: Optional[AgentServer] = self._build_agent() if self.is_exporter else None
+        #: 给其它插件用的 Python API（见 ``mirror_up.api``）。
+        self.api = MirrorUPAPI(self)
 
         self._sync_thread: Optional[threading.Thread] = None
         self._scheduler_thread: Optional[threading.Thread] = None
@@ -238,6 +241,46 @@ class MirrorUP:
             source.reply(message)
         except Exception:  # pragma: no cover - 玩家可能已离线
             self.server.logger.debug("[%s] 回复消息失败", APP_NAME, exc_info=True)
+
+    def start_verify(self, source: Optional[CommandSource], deep: bool = False) -> None:
+        """``!!mu verify``：只读校验，放后台线程跑（深校验可能读几分钟）。"""
+        if self.is_exporter or self.engine is None:
+            self._reply(
+                source,
+                RText(f"[{APP_NAME}] 当前是 exporter 节点，校验请到 driver 上执行", RColor.yellow),
+            )
+            return
+        if self.engine.is_busy():
+            self._reply(source, RText(f"[{APP_NAME}] 同步进行中，等本轮结束后再校验", RColor.yellow))
+            return
+        thread = threading.Thread(
+            target=self._run_verify, args=(source, deep), name="MirrorUP-verify", daemon=True
+        )
+        thread.start()
+
+    def _run_verify(self, source: Optional[CommandSource], deep: bool) -> None:
+        if deep:
+            self._reply(
+                source,
+                RText(f"[{APP_NAME}] 深校验开始，会读取源端与镜像的全部内容", RColor.gray),
+            )
+        try:
+            report = self.api.verify(deep=deep)
+        except Exception as exc:  # noqa: BLE001 - 校验失败要能回报
+            self.server.logger.exception("[%s] 校验异常", APP_NAME)
+            self._reply(source, RText(f"[{APP_NAME}] 校验失败：{exc}", RColor.red))
+            return
+        rendered = commands.render_verify(report)
+        self.server.logger.info(rendered.to_plain_text())
+        self._reply(source, rendered)
+
+    def history(self, limit: int = 10) -> List[dict]:
+        """最近几轮同步记录（``!!mu history`` 与 Python API 共用）。"""
+        try:
+            return self.index.list_history(limit=max(1, int(limit)))
+        except Exception:  # pragma: no cover - 索引损坏时不要让命令炸
+            self.server.logger.exception("[%s] 读取同步历史失败", APP_NAME)
+            return []
 
     # ------------------------------------------------------------------ #
     # 命令层需要的接口

@@ -1,8 +1,8 @@
 {
   "id": "mirror_up",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "MirrorUP",
-  "description": "Incremental mirror sync for MCDR: changed files, region chunks and external chunks only; optional cross-machine agent and auto stop/start",
+  "description": "Incremental mirror sync for MCDR: changed files, region chunks and external chunks; multi-target, verify/history, cross-machine agent, MCSM/rcon/external auto stop",
   "author": [
     "MiYui34"
   ],

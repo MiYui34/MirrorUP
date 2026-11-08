@@ -312,6 +312,8 @@ CREATE TABLE pending (
 ) WITHOUT ROWID;
 ```
 
+**v0.5 实际 schema（多目标）**：新增 `targets(id, name UNIQUE, root)`；`files` / `regions` / `pending` 三张表都加了 `target_id INTEGER NOT NULL` 并进入主键——同一个 set 不再只有一份索引，而是每个镜像目标各一份。新增 `history(id, target, trigger, started_at, finished_at, ok, dry_run, applied, deleted, deferred, failed, bytes_written, duration, summary, detail)` 支撑 `!!mu history`。`DEFAULT_TARGET_ID = 1`，单目标配置下行为与 v0.4 相同；旧库升级时三张表先改名 `*_v4`、按 `target_id = 1` 灌回再删旧表。`meta` 里每轮的时间戳按目标分区，键名后缀 `:<target_id>`（`target_id = 1` 时回退读旧的无后缀键，兼容 v0.4）。
+
 体量估算：15 万文件 × 约 120B ≈ 18MB；3000 region × (8KB 哈希表) ≈ 24MB；加上 `header` 列约 48MB。可接受。关闭 `header` 列可省一半。
 
 `pending` 表记录本轮因"文件正在被写、重试耗尽"而延后的对象，下一轮优先处理并在 `!!mu status` 中显示。
@@ -729,7 +731,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 |---|---|---|
 | `manual` | 只检查，不操作；未停止则中止同步并提示 | v0.1（v0.4 仍是默认） |
 | `rcon` | RCON `stop`（可选先 `say` 倒计时）+ TCP 端口探活 + 可选 `start_cmd` 启动 | v0.4 |
-| `mcsm` | 调用 MCSM API | 未实现，配置了也按 `manual` 处理并告警 |
+| `mcsm` | 调用 MCSManager API：v9 用 `apikey` 查询参数，v10 用 `/api/auth/login` 换 Bearer token；`/api/protected_instance/status|stop|start` | v0.5 |
 | `external` | 调用用户提供的命令钩子（`stop_cmd` / `start_cmd` / `probe_cmd`） | v0.4 |
 
 `external` 是万能兜底：用户写一个 shell 脚本就能接任何面板。
@@ -749,7 +751,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 
 ```jsonc
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "role": "driver",                      // driver | exporter
 
   "source": {
@@ -764,8 +766,13 @@ class MirrorControl(Protocol):         # v0.4 实际接口
   },
 
   "target": {
-    "root": "./Mirror/server"
+    "root": "./Mirror/server"            // 单目标简写，等价于 targets[0]
   },
+  "targets": [                           // v0.5：可写多个；每个目标可覆盖 mirror_control
+    { "name": "default", "root": "./Mirror/server", "enabled": true }
+    // { "name": "mirror2", "root": "./Mirror2/server", "enabled": true,
+    //   "mirror_control": { "adapter": "rcon", "rcon": { ... } } }
+  ],
 
   // config/ 与 server.properties 不在默认集合内（见 D8）；确需同步时由用户自行添加 set。
   "sets": [
@@ -791,6 +798,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
     "region_write_mode": "inplace",      // rebuild | inplace（inplace 从 v0.3 起是默认）
     "region_compaction_ratio": 0.5,      // 碎片扇区 > 存活扇区 * 0.5 时整文件重建
     "journal": true,                     // inplace 的头快照；false 会把写入模式降级为 rebuild
+    "clean_mcc_orphans": true,           // 删除不再被任何 region 引用的 .mcc（v0.5）
     "max_retry": 3,
     "defer_unstable": true               // 读不稳定的文件延后到下一轮，而不是整轮失败
   },
@@ -811,6 +819,16 @@ class MirrorControl(Protocol):         # v0.4 实际接口
     "adapter": "manual",
     "rcon": { "host": "127.0.0.1", "port": 25575, "password": "" },
     "external": { "stop_cmd": "", "start_cmd": "", "probe_cmd": "" },
+    "mcsm": {                              // v0.5：MCSM 9 用 apikey，MCSM 10 用 username/password 登录
+      "base_url": "http://127.0.0.1:23333",
+      "apikey": "",
+      "uuid": "",
+      "remote_uuid": "",
+      "username": "",
+      "password": "",
+      "timeout_sec": 10,
+      "insecure_tls": false
+    },
     "stop_timeout_sec": 120,
     "start_after_sync": true,
     "wait_ready_timeout_sec": 180,
@@ -841,13 +859,14 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 校验规则：
 
 - `schedule.interval_seconds` 超限直接 clamp 到 `max_interval_seconds` 并在控制台告警。
-- `source.root` 与 `target.root` 解析为绝对路径后**不允许互相包含**（防止把镜像目录同步进自己）。
+- `source.root` 与每个 `targets[].root` 解析为绝对路径后**不允许互相包含**（防止把镜像目录同步进自己）。
+- 多目标：`targets[].name` 必须唯一、目录不能重复（`normcase` 后比较）、每个目标上的 set 目标路径不能重复。
 - `sets[].target` 重名 → 拒绝启动。
 - `region_write_mode=inplace` 从 v0.3 起可用且是默认；`journal=false` 时自动降级为 `rebuild` 并告警（没有头快照的 inplace 不提供崩溃保护）；`region_compaction_ratio < 0` 视为 0（只受"不缩小文件"限制，有碎片就整理）。`region_delta` 从 v0.2 起真正生效（v0.1 打开只会告警并忽略）。
 - 跨机时 `agent.url` 指向自身地址 → 拒绝（防止自我同步）。
 - `source.transport` 只能是 `local` / `agent`，其他值直接 `ConfigError`；`agent` 模式下 `agent.url` 必须是 http(s)，不再检查本地 `source.root` 是否存在（那是 exporter 的事）。
 - `role=exporter` 时 `agent_server.token` 少于 16 字符 → 拒绝启动 agent；少于 32 字符 → 告警。
-- `mirror_control.adapter=rcon` 但 `rcon.password` 为空 → 告警（RCON 通常会拒绝登录）；`adapter=external` 缺 `stop_cmd` 或 `start_cmd` → 告警；`adapter=mcsm` → 告警「v0.4 未实现，按 manual 处理」。
+- `mirror_control.adapter=rcon` 但 `rcon.password` 为空 → 告警（RCON 通常会拒绝登录）；`adapter=external` 缺 `stop_cmd` 或 `start_cmd` → 告警；`adapter=mcsm` 要求 `base_url` 为 http(s)、`uuid`/`remote_uuid` 必填、`apikey` 或 `username`+`password` 至少一组，否则告警。以上检查对全局配置与每个目标的覆盖段各跑一遍。
 
 ---
 
@@ -862,7 +881,8 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | `!!mu sync --full` | 2 | 忽略索引，全量重哈希 + 全量比对（会重读整个世界，建议在维护窗口用） |
 | `!!mu diff` | 2 | 同 `sync --dry-run`，但只显示摘要 |
 | `!!mu status` | 0 | 索引状态、上次同步、下次定时、pending 数量 |
-| `!!mu verify [--deep]` | 2 | 抽样/全量校验镜像与索引一致性（v0.5，尚未实现） |
+| `!!mu verify [--deep]` | 2 | 核对源/镜像/索引三方一致性；`--deep` 逐个比哈希（v0.5） |
+| `!!mu history [N]` | 0 | 最近 N 轮结果（默认 10，上限 50）（v0.5） |
 | `!!mu cancel` | 2 | 取消进行中的同步 |
 | `!!mu schedule on\|off` | 3 | 开关自动同步 |
 | `!!mu schedule set <1m\|2h\|3d>` | 3 | 设置间隔（下限 60 秒，上限 7 天） |
@@ -970,7 +990,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 
 `verify --deep` 的实现：重新计算源端与目标端全部 chunk 哈希并逐一比对（不比对文件哈希，因为目标布局独立于源，见 §8.4）。
 
-**v0.4 实际落地的测试**（`tests/`，不进仓库，随源码分发时可另行提供）：
+**v0.4 / v0.5 实际落地的测试**（`tests/`，不进仓库，随源码分发时可另行提供）：
 
 | 脚本 | 覆盖 |
 |---|---|
@@ -978,8 +998,9 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | `smoke_region.py` | region 首次构建、未变零读、只改一个 chunk、增删 chunk、坏文件/外置 chunk、rebuild 与 inplace 两种引擎路径、journal 恢复、compaction |
 | `smoke_commands.py` | 命令树注册、参数解析、渲染、`entry` 导入与包级导出 |
 | `smoke_v04.py` | wire 编解码、`AgentSource` 与 `LocalSource` 等价、跨机只写脏 chunk、`.mcc` 外置 chunk、external / rcon 适配器、配置 v4 校验 |
+| `smoke_v05.py` | 双目标各自独立计划与恢复、同步历史、浅/深校验（含"同大小同 mtime 改内容"）、`mirror_up.api`、exporter 拒绝同步、set 改名复用索引、孤儿 `.mcc` 清理、MCSM 适配器（假面板双鉴权）、随机化往返（manifest 300 / region 头 200 组 / chunk state 30 组） |
 
-属性测试 / fuzz / 差分测试仍是计划项，没有实现；当前用真实 region 的小样本 + 手工注入覆盖。
+属性测试 / fuzz / 差分测试仍只有"随机化往返"这一层，没有接 Hypothesis，也没有与 `robocopy` 做差分。
 
 ---
 
@@ -991,7 +1012,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 | **v0.2** ✅ | region chunk 级增量（`rebuild`）+ chunk 读—复验 + 定时 | Profile B 稳态一轮 < 5 s；源端读取量下降一个数量级（目标端写入量不变，见 §8.6 第 2 条） |
 | **v0.3** ✅ | `inplace` append-and-commit + compaction + 头 journal（§8.7） | 写量降到"脏 chunk + 16KB"，崩溃注入后靠 journal 恢复旧头 |
 | **v0.4** ✅ | 跨机 `agent` 传输 + TLS + `rcon`/`external` 停服 + `.mcc` 外置 chunk 增量 + 配置 schema v4 | 同机/跨机结果一致；`.mcc` 改内容能触发同步；停止不了镜像时拒绝写盘 |
-| **v0.5** | `verify`、同步历史、`!!mu status` 增强、多镜像目标共享索引、Python API 对外开放 | 第三方插件可调用 |
+| **v0.5** ✅ | `verify`（浅/深）、同步历史、多镜像目标共享索引（schema v5）、`mcsm` 适配器、`.mcc` 孤儿清理、set 改名复用索引、Python API（`mirror_up.api`） | 多目标各写各的、互不串写；深校验能发现"同大小同 mtime 的源内容变化"；第三方可 `get_api()` 调用 |
 | 可选 | btrfs/zfs snapshot 加速后端、空闲触发、WebUI | — |
 
 ---
@@ -1014,13 +1035,10 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 
 ## 22. 未决问题
 
-1. **多镜像目标**：一个源同步到 N 个镜像时，是否共享索引（每目标一份 vs 一份全局 + 目标差异表）？当前设计为每目标一份。
-2. **`level.dat` 字段级同步**：整文件覆盖会把 `LevelName`/`LastPlayed` 也带过去，是否需要字段白名单（v0.5？）。
-3. **`.mcc` 的孤儿清理**：源端删除外置 chunk 后，`.mcc` 文件是否会被 `strict` 模式正确删除？需要专门测试。
-4. **按需同步**：镜像无人时不启动，玩家进入前才同步——这会把 5 秒的增量变成"首次全量"，是否需要预热缓存？
-5. **索引与 set 的绑定**：用户重命名 set 时，索引该如何迁移（当前视为新 set → 全量）。
+1. **`level.dat` 字段级同步**：整文件覆盖会把 `LevelName`/`LastPlayed` 也带过去，是否需要字段白名单？
+2. **按需同步**：镜像无人时不启动，玩家进入前才同步——这会把 5 秒的增量变成"首次全量"，是否需要预热缓存？
 
-已决：`config/` 是否同步 → **不同步**（D8，2026-11-08 确认）。
+已决：`config/` 是否同步 → **不同步**（D8，2026-11-08 确认）。多镜像目标 → **共享一个索引、按 `target_id` 分区**（每目标一份记录，schema v5，v0.5）；`.mcc` 孤儿清理 → **做了**，按 region 覆盖的 32×32 坐标范围删未被引用的 `.mcc`，开关 `sync.clean_mcc_orphans`（v0.5）；set 改名 → **复用索引**：`(source_rel, target_rel)` 相同而名字变了时 `UPDATE` 名字、保留 id 与全部行（v0.5）。
 
 ---
 

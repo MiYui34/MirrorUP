@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
 import time
@@ -23,10 +24,18 @@ from typing import Dict, List, Optional, Tuple
 
 from .constants import INDEX_BATCH_ROWS, INDEX_BATCH_SECONDS
 
+logger = logging.getLogger("mirror_up")
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS targets (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  root TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sets (
@@ -37,6 +46,7 @@ CREATE TABLE IF NOT EXISTS sets (
 );
 
 CREATE TABLE IF NOT EXISTS files (
+  target_id  INTEGER NOT NULL,
   set_id     INTEGER NOT NULL,
   path       TEXT    NOT NULL,
   kind       INTEGER NOT NULL,
@@ -45,27 +55,51 @@ CREATE TABLE IF NOT EXISTS files (
   hash       BLOB,
   region     INTEGER NOT NULL,
   synced_at  INTEGER NOT NULL,
-  PRIMARY KEY (set_id, path)
+  PRIMARY KEY (target_id, set_id, path)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS regions (
+  target_id    INTEGER NOT NULL,
   set_id       INTEGER NOT NULL,
   path         TEXT    NOT NULL,
   chunk_hashes BLOB    NOT NULL,
   header       BLOB,
-  PRIMARY KEY (set_id, path)
+  PRIMARY KEY (target_id, set_id, path)
 ) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS pending (
-  set_id INTEGER NOT NULL,
-  path   TEXT    NOT NULL,
-  reason TEXT    NOT NULL,
-  at     INTEGER NOT NULL,
-  PRIMARY KEY (set_id, path)
+  target_id INTEGER NOT NULL,
+  set_id    INTEGER NOT NULL,
+  path      TEXT    NOT NULL,
+  reason    TEXT    NOT NULL,
+  at        INTEGER NOT NULL,
+  PRIMARY KEY (target_id, set_id, path)
 ) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_pending_set ON pending(set_id);
+CREATE TABLE IF NOT EXISTS history (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  target     TEXT    NOT NULL,
+  trigger    TEXT    NOT NULL,
+  started_at INTEGER NOT NULL,
+  finished_at INTEGER NOT NULL,
+  ok         INTEGER NOT NULL,
+  dry_run    INTEGER NOT NULL,
+  applied    INTEGER NOT NULL,
+  deleted    INTEGER NOT NULL,
+  deferred   INTEGER NOT NULL,
+  failed     INTEGER NOT NULL,
+  bytes_written INTEGER NOT NULL,
+  duration   REAL    NOT NULL,
+  summary    TEXT    NOT NULL,
+  detail     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_set ON pending(target_id, set_id);
+CREATE INDEX IF NOT EXISTS idx_history_time ON history(finished_at);
 """
+
+#: 兼容 v0.4 及更早的单一目标索引：老数据全部归到这个目标下。
+DEFAULT_TARGET_ID = 1
 
 KIND_FILE = 0
 KIND_DIR = 1
@@ -111,6 +145,45 @@ class Index:
     def _ensure_schema(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+            self._conn.execute(
+                "INSERT OR IGNORE INTO targets(id, name, root) VALUES(?, ?, ?)",
+                (DEFAULT_TARGET_ID, "default", ""),
+            )
+
+    def _migrate(self) -> None:
+        """v0.4 及更早的索引没有 target_id / targets / history，就地升级。"""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(files)")}
+        if "target_id" in columns:
+            return
+        logger.info("[MirrorUP] 索引升级到 schema v5（多镜像目标）")
+        self._conn.executescript(
+            """
+            ALTER TABLE files   RENAME TO files_v4;
+            ALTER TABLE regions RENAME TO regions_v4;
+            ALTER TABLE pending RENAME TO pending_v4;
+            """
+        )
+        self._conn.executescript(SCHEMA)
+        self._conn.execute("INSERT OR IGNORE INTO targets(id, name, root) VALUES(?, 'default', '')", (DEFAULT_TARGET_ID,))
+        self._conn.execute(
+            "INSERT INTO files(target_id, set_id, path, kind, size, mtime_ns, hash, region, synced_at) "
+            "SELECT ?, set_id, path, kind, size, mtime_ns, hash, region, synced_at FROM files_v4",
+            (DEFAULT_TARGET_ID,),
+        )
+        self._conn.execute(
+            "INSERT INTO regions(target_id, set_id, path, chunk_hashes, header) "
+            "SELECT ?, set_id, path, chunk_hashes, header FROM regions_v4",
+            (DEFAULT_TARGET_ID,),
+        )
+        self._conn.execute(
+            "INSERT INTO pending(target_id, set_id, path, reason, at) "
+            "SELECT ?, set_id, path, reason, at FROM pending_v4",
+            (DEFAULT_TARGET_ID,),
+        )
+        self._conn.executescript(
+            "DROP TABLE files_v4; DROP TABLE regions_v4; DROP TABLE pending_v4;"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -223,6 +296,24 @@ class Index:
     def upsert_set(self, name: str, source_rel: str, target_rel: str) -> int:
         with self._lock:
             self._begin_locked()
+            existing = self._conn.execute(
+                "SELECT id FROM sets WHERE name = ?", (name,)
+            ).fetchone()
+            if existing is None:
+                # set 改名复用：源/目标相对路径都没变，只换了名字。把旧行改成新名字，
+                # 这样 files/regions/pending 里的 set_id 全部保留，下一轮不用重扫。
+                row = self._conn.execute(
+                    "SELECT id FROM sets WHERE source_rel = ? AND target_rel = ? "
+                    "ORDER BY id LIMIT 1",
+                    (source_rel, target_rel),
+                ).fetchone()
+                if row is not None:
+                    self._conn.execute(
+                        "UPDATE sets SET name = ? WHERE id = ?", (name, int(row[0]))
+                    )
+                    self._after_write()
+                    logger.info("[MirrorUP] set 改名复用索引：%r（id=%s）", name, row[0])
+                    return int(row[0])
             self._conn.execute(
                 "INSERT INTO sets(name, source_rel, target_rel) VALUES(?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET source_rel = excluded.source_rel, "
@@ -244,11 +335,41 @@ class Index:
     # files
     # ------------------------------------------------------------------ #
 
-    def load_files(self, set_id: int) -> Dict[str, FileRow]:
+    # ------------------------------------------------------------------ #
+    # targets
+    # ------------------------------------------------------------------ #
+
+    def upsert_target(self, name: str, root: str) -> int:
+        with self._lock:
+            self._begin_locked()
+            self._conn.execute(
+                "INSERT INTO targets(name, root) VALUES(?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET root = excluded.root",
+                (name, root),
+            )
+            row = self._conn.execute("SELECT id FROM targets WHERE name = ?", (name,)).fetchone()
+            self._after_write()
+            if row is None:
+                raise IndexError_(f"写入 target {name!r} 失败")
+            return int(row[0])
+
+    def load_targets(self) -> Dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute("SELECT name, id FROM targets").fetchall()
+        return {name: int(tid) for name, tid in rows}
+
+    # ------------------------------------------------------------------ #
+    # files
+    # ------------------------------------------------------------------ #
+
+    def load_files(
+        self, set_id: int, target_id: int = DEFAULT_TARGET_ID
+    ) -> Dict[str, FileRow]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT path, kind, size, mtime_ns, hash, region, synced_at FROM files WHERE set_id = ?",
-                (set_id,),
+                "SELECT path, kind, size, mtime_ns, hash, region, synced_at FROM files "
+                "WHERE target_id = ? AND set_id = ?",
+                (target_id, set_id),
             ).fetchall()
         result: Dict[str, FileRow] = {}
         for path, kind, size, mtime_ns, digest, region, synced_at in rows:
@@ -263,16 +384,17 @@ class Index:
             )
         return result
 
-    def put_file(self, set_id: int, row: FileRow) -> None:
+    def put_file(self, set_id: int, row: FileRow, target_id: int = DEFAULT_TARGET_ID) -> None:
         with self._lock:
             self._begin_locked()
             self._conn.execute(
-                "INSERT INTO files(set_id, path, kind, size, mtime_ns, hash, region, synced_at) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(set_id, path) DO UPDATE SET kind = excluded.kind, size = excluded.size, "
-                "mtime_ns = excluded.mtime_ns, hash = excluded.hash, region = excluded.region, "
-                "synced_at = excluded.synced_at",
+                "INSERT INTO files(target_id, set_id, path, kind, size, mtime_ns, hash, region, synced_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(target_id, set_id, path) DO UPDATE SET kind = excluded.kind, "
+                "size = excluded.size, mtime_ns = excluded.mtime_ns, hash = excluded.hash, "
+                "region = excluded.region, synced_at = excluded.synced_at",
                 (
+                    target_id,
                     set_id,
                     row.path,
                     int(row.kind),
@@ -285,48 +407,75 @@ class Index:
             )
             self._after_write()
 
-    def delete_file(self, set_id: int, path: str) -> None:
+    def delete_file(self, set_id: int, path: str, target_id: int = DEFAULT_TARGET_ID) -> None:
         with self._lock:
             self._begin_locked()
-            self._conn.execute("DELETE FROM files WHERE set_id = ? AND path = ?", (set_id, path))
-            self._conn.execute("DELETE FROM regions WHERE set_id = ? AND path = ?", (set_id, path))
+            self._conn.execute(
+                "DELETE FROM files WHERE target_id = ? AND set_id = ? AND path = ?",
+                (target_id, set_id, path),
+            )
+            self._conn.execute(
+                "DELETE FROM regions WHERE target_id = ? AND set_id = ? AND path = ?",
+                (target_id, set_id, path),
+            )
             self._after_write()
 
-    def count_files(self, set_id: int) -> int:
-        with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) FROM files WHERE set_id = ?", (set_id,)).fetchone()
-        return int(row[0]) if row else 0
-
-    def total_stats(self) -> Tuple[int, int]:
-        """返回 (文件数, 总字节数)。"""
+    def count_files(self, set_id: int, target_id: int = DEFAULT_TARGET_ID) -> int:
         with self._lock:
             row = self._conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE kind = 0"
+                "SELECT COUNT(*) FROM files WHERE target_id = ? AND set_id = ?",
+                (target_id, set_id),
             ).fetchone()
+        return int(row[0]) if row else 0
+
+    def total_stats(self, target_id: Optional[int] = None) -> Tuple[int, int]:
+        """返回 (文件数, 总字节数)；``target_id=None`` 表示全部目标。"""
+        with self._lock:
+            if target_id is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE kind = 0"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files "
+                    "WHERE kind = 0 AND target_id = ?",
+                    (target_id,),
+                ).fetchone()
         return (int(row[0]), int(row[1])) if row else (0, 0)
 
     # ------------------------------------------------------------------ #
-    # regions（v0.2 使用；v0.1 仅保证表存在）
+    # regions
     # ------------------------------------------------------------------ #
 
-    def get_region(self, set_id: int, path: str) -> Optional[Tuple[bytes, Optional[bytes]]]:
+    def get_region(
+        self, set_id: int, path: str, target_id: int = DEFAULT_TARGET_ID
+    ) -> Optional[Tuple[bytes, Optional[bytes]]]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT chunk_hashes, header FROM regions WHERE set_id = ? AND path = ?",
-                (set_id, path),
+                "SELECT chunk_hashes, header FROM regions "
+                "WHERE target_id = ? AND set_id = ? AND path = ?",
+                (target_id, set_id, path),
             ).fetchone()
         if row is None:
             return None
         return bytes(row[0]), (bytes(row[1]) if row[1] is not None else None)
 
-    def put_region(self, set_id: int, path: str, chunk_hashes: bytes, header: Optional[bytes]) -> None:
+    def put_region(
+        self,
+        set_id: int,
+        path: str,
+        chunk_hashes: bytes,
+        header: Optional[bytes],
+        target_id: int = DEFAULT_TARGET_ID,
+    ) -> None:
         with self._lock:
             self._begin_locked()
             self._conn.execute(
-                "INSERT INTO regions(set_id, path, chunk_hashes, header) VALUES(?, ?, ?, ?) "
-                "ON CONFLICT(set_id, path) DO UPDATE SET chunk_hashes = excluded.chunk_hashes, "
-                "header = excluded.header",
-                (set_id, path, chunk_hashes, header),
+                "INSERT INTO regions(target_id, set_id, path, chunk_hashes, header) "
+                "VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(target_id, set_id, path) DO UPDATE SET "
+                "chunk_hashes = excluded.chunk_hashes, header = excluded.header",
+                (target_id, set_id, path, chunk_hashes, header),
             )
             self._after_write()
 
@@ -334,49 +483,129 @@ class Index:
     # pending
     # ------------------------------------------------------------------ #
 
-    def put_pending(self, set_id: int, path: str, reason: str, at: int) -> None:
+    def put_pending(
+        self,
+        set_id: int,
+        path: str,
+        reason: str,
+        at: int,
+        target_id: int = DEFAULT_TARGET_ID,
+    ) -> None:
         with self._lock:
             self._begin_locked()
             self._conn.execute(
-                "INSERT INTO pending(set_id, path, reason, at) VALUES(?, ?, ?, ?) "
-                "ON CONFLICT(set_id, path) DO UPDATE SET reason = excluded.reason, at = excluded.at",
-                (set_id, path, reason, at),
+                "INSERT INTO pending(target_id, set_id, path, reason, at) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(target_id, set_id, path) DO UPDATE SET "
+                "reason = excluded.reason, at = excluded.at",
+                (target_id, set_id, path, reason, at),
             )
             self._after_write()
 
-    def clear_pending(self, set_id: int, path: str) -> None:
+    def clear_pending(self, set_id: int, path: str, target_id: int = DEFAULT_TARGET_ID) -> None:
         with self._lock:
             self._begin_locked()
-            self._conn.execute("DELETE FROM pending WHERE set_id = ? AND path = ?", (set_id, path))
+            self._conn.execute(
+                "DELETE FROM pending WHERE target_id = ? AND set_id = ? AND path = ?",
+                (target_id, set_id, path),
+            )
             self._after_write()
 
-    def purge_pending(self, valid_paths: Dict[int, set]) -> None:
+    def purge_pending(self, valid_paths: Dict[Tuple[int, int], set]) -> None:
         """清掉已经不再需要的 pending 行（文件已同步/已消失）。"""
         with self._lock:
-            rows = self._conn.execute("SELECT set_id, path FROM pending").fetchall()
-            stale = [(sid, path) for sid, path in rows if path not in valid_paths.get(int(sid), set())]
+            rows = self._conn.execute("SELECT target_id, set_id, path FROM pending").fetchall()
+            stale = [
+                (tid, sid, path)
+                for tid, sid, path in rows
+                if path not in valid_paths.get((int(tid), int(sid)), set())
+            ]
             if not stale:
                 return
             self._begin_locked()
-            self._conn.executemany("DELETE FROM pending WHERE set_id = ? AND path = ?", stale)
+            self._conn.executemany(
+                "DELETE FROM pending WHERE target_id = ? AND set_id = ? AND path = ?", stale
+            )
             self._commit_locked()
 
-    def list_pending(self, set_id: Optional[int] = None) -> List[Tuple[int, str, str, int]]:
+    def list_pending(
+        self, set_id: Optional[int] = None, target_id: Optional[int] = None
+    ) -> List[Tuple[int, int, str, str, int]]:
+        """返回 ``[(target_id, set_id, path, reason, at), ...]``。"""
+        clauses: List[str] = []
+        params: List[object] = []
+        if set_id is not None:
+            clauses.append("set_id = ?")
+            params.append(set_id)
+        if target_id is not None:
+            clauses.append("target_id = ?")
+            params.append(target_id)
+        sql = "SELECT target_id, set_id, path, reason, at FROM pending"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         with self._lock:
-            if set_id is None:
-                rows = self._conn.execute("SELECT set_id, path, reason, at FROM pending").fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT set_id, path, reason, at FROM pending WHERE set_id = ?", (set_id,)
-                ).fetchall()
-        return [(int(a), b, c, int(d)) for a, b, c, d in rows]
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [(int(a), int(b), c, d, int(e)) for a, b, c, d, e in rows]
+
+    # ------------------------------------------------------------------ #
+    # history
+    # ------------------------------------------------------------------ #
+
+    def add_history(self, record: Dict[str, object]) -> None:
+        with self._lock:
+            self._begin_locked()
+            self._conn.execute(
+                "INSERT INTO history(target, trigger, started_at, finished_at, ok, dry_run, "
+                "applied, deleted, deferred, failed, bytes_written, duration, summary, detail) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.get("target", ""),
+                    record.get("trigger", ""),
+                    int(record.get("started_at", 0)),
+                    int(record.get("finished_at", 0)),
+                    1 if record.get("ok") else 0,
+                    1 if record.get("dry_run") else 0,
+                    int(record.get("applied", 0)),
+                    int(record.get("deleted", 0)),
+                    int(record.get("deferred", 0)),
+                    int(record.get("failed", 0)),
+                    int(record.get("bytes_written", 0)),
+                    float(record.get("duration", 0.0)),
+                    str(record.get("summary", "")),
+                    record.get("detail"),
+                ),
+            )
+            self._after_write()
+
+    def list_history(self, limit: int = 20) -> List[Dict[str, object]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, target, trigger, started_at, finished_at, ok, dry_run, applied, "
+                "deleted, deferred, failed, bytes_written, duration, summary "
+                "FROM history ORDER BY id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        keys = (
+            "id", "target", "trigger", "started_at", "finished_at", "ok", "dry_run",
+            "applied", "deleted", "deferred", "failed", "bytes_written", "duration", "summary",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
+    def prune_history(self, keep: int) -> None:
+        with self._lock:
+            self._begin_locked()
+            self._conn.execute(
+                "DELETE FROM history WHERE id NOT IN "
+                "(SELECT id FROM history ORDER BY id DESC LIMIT ?)",
+                (max(1, int(keep)),),
+            )
+            self._after_write()
 
     # ------------------------------------------------------------------ #
     # 维护
     # ------------------------------------------------------------------ #
 
     def wipe(self) -> None:
-        """清空全部数据（索引重建）。"""
+        """清空同步状态（索引重建）；保留历史与目标登记。"""
         with self._lock:
             self._conn.executescript(
                 "DELETE FROM pending; DELETE FROM regions; DELETE FROM files; DELETE FROM sets; DELETE FROM meta;"

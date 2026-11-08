@@ -22,10 +22,11 @@ import secrets
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Set, Tuple
 
 from .config import SyncConfig
 from .constants import PENDING_BUSY, PENDING_UNSTABLE, PENDING_VANISHED
+from .hashing import region_coords
 from .planner import Op, OpKind
 from .region import (
     RegionExternalChunk,
@@ -188,6 +189,15 @@ class Applier:
                         force_full=op.force_write,
                         get_record=get_record,
                     )
+                dropped = self._clean_orphan_mcc(
+                    dst, {Path(p).name for p in (scan.external_files or set())}
+                )
+                if dropped:
+                    logger.info(
+                        "[MirrorUP] %s: 清理了 %d 个不再被引用的 .mcc 外置 chunk",
+                        op.path,
+                        dropped,
+                    )
                 return ApplyResult(
                     op=op,
                     status="applied",
@@ -243,6 +253,44 @@ class Applier:
                 pending_reason=pending_reason,
             )
         return ApplyResult(op=op, status="failed", detail=last_detail or "重试耗尽")
+
+    def _clean_orphan_mcc(self, region_file: Path, expected: Set[str]) -> int:
+        """删除本 region 的 32×32 区块范围内、不再被任何 chunk 引用的 ``.mcc``。
+
+        只在真正写过这个 region 之后调用：``expected`` 是源端扫描出的全部外置
+        chunk 文件名。范围外（别的 region 的坐标）一律不碰。
+        """
+        if not self.sync.clean_mcc_orphans:
+            return 0
+        coords = region_coords(region_file.name)
+        if coords is None:
+            return 0
+        rx, rz = coords
+        x0, z0 = rx * 32, rz * 32
+        removed = 0
+        try:
+            children = list(region_file.parent.iterdir())
+        except OSError:
+            return 0
+        for child in children:
+            name = child.name
+            if not (name.startswith("c.") and name.endswith(".mcc")):
+                continue
+            try:
+                cx_text, cz_text = name[2:-4].split(".")
+                cx, cz = int(cx_text), int(cz_text)
+            except ValueError:
+                continue
+            if not (x0 <= cx < x0 + 32 and z0 <= cz < z0 + 32):
+                continue
+            if name in expected:
+                continue
+            try:
+                child.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.warning("[MirrorUP] 删除孤儿外置 chunk 失败 %s：%s", child, exc)
+        return removed
 
     def _log_fallback(self, op: Op, reason: str) -> None:
         logger.warning("[MirrorUP] region %s 降级为整文件复制：%s", op.path, reason)

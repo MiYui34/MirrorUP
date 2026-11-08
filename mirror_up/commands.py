@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import List, Optional, Tuple
 
+import time
+
 from mcdreforged.api.all import CommandSource, GreedyText, Literal, RColor, RText, RTextList
 
 from .config import ConfigError, save_config
@@ -65,26 +67,44 @@ def _parse_flags(raw: str) -> Tuple[bool, bool, bool]:
 
 
 def render_plan(plugin, report: RoundReport) -> RTextList:
-    plan = report.plan
     lines = [_line(f"[{APP_NAME}] 计划摘要（{report.duration:.2f}s）", RColor.aqua)]
 
-    if plan is None:
+    entries = list(report.plans.items()) if report.plans else []
+    if not entries and report.plan is not None:
+        entries = [("default", report.plan)]
+    if not entries:
         lines.append(_line("  （没有生成计划）", RColor.gray))
         return _join(lines)
 
-    lines.append(
-        _line(
-            f"  新增 {plan.add_count()} 文件 / {_mb(plan.add_bytes())}，"
-            f"修改 {plan.modify_count()} 文件 / {_mb(plan.modify_bytes())}，"
-            f"删除 {plan.delete_count()} 文件 / {_mb(plan.delete_bytes())}"
+    multi = len(entries) > 1
+    for name, plan in entries:
+        prefix = f"  [{name}] " if multi else "  "
+        lines.append(
+            _line(
+                f"{prefix}新增 {plan.add_count()} 文件 / {_mb(plan.add_bytes())}，"
+                f"修改 {plan.modify_count()} 文件 / {_mb(plan.modify_bytes())}，"
+                f"删除 {plan.delete_count()} 文件 / {_mb(plan.delete_bytes())}"
+            )
         )
-    )
-    lines.append(
-        _line(
-            f"  未变（跳过）{plan.unchanged_files()} 文件 / {_mb(plan.unchanged_bytes())}，"
-            f"目录操作 {plan.dir_count()}"
+        lines.append(
+            _line(
+                f"{prefix}未变（跳过）{plan.unchanged_files()} 文件 / {_mb(plan.unchanged_bytes())}，"
+                f"目录操作 {plan.dir_count()}",
+                RColor.gray,
+            )
         )
-    )
+        if plugin.config.log.verbose_plan:
+            for set_plan in plan.sets:
+                for op in set_plan.ops[:20]:
+                    lines.append(
+                        _line(
+                            f"      {op.kind:<7} {name}:{set_plan.set_name}:{op.path}  [{op.reason}]",
+                            RColor.gray,
+                        )
+                    )
+                if len(set_plan.ops) > 20:
+                    lines.append(_line(f"      …… 还有 {len(set_plan.ops) - 20} 项", RColor.gray))
+
     if report.scan_errors:
         lines.append(_line(f"  扫描错误 {report.scan_errors} 项（相关路径本轮不参与删除）", RColor.yellow))
     for warning in report.warnings[:5]:
@@ -93,13 +113,6 @@ def render_plan(plugin, report: RoundReport) -> RTextList:
         lines.append(_line(f"  已中止：{report.abort_reason}", RColor.red))
     if report.error:
         lines.append(_line(f"  失败：{report.error}", RColor.red))
-
-    if plugin.config.log.verbose_plan and plan is not None:
-        for set_plan in plan.sets:
-            for op in set_plan.ops[:40]:
-                lines.append(_line(f"    {op.kind:<7} {set_plan.set_name}:{op.path}  [{op.reason}]", RColor.gray))
-            if len(set_plan.ops) > 40:
-                lines.append(_line(f"    …… 还有 {len(set_plan.ops) - 40} 项", RColor.gray))
     return _join(lines)
 
 
@@ -122,16 +135,30 @@ def render_report(report: RoundReport) -> RTextList:
             head_color,
         )
     ]
-    detail = (
-        f"  内容未变（仅更新索引）{report.unchanged_after_hash}，"
-        f"目录 {report.dirs}，延后 {report.deferred}，失败 {report.failed}"
-    )
-    if report.regions_delta:
-        detail += (
-            f"\n  region 增量 {report.regions_delta} 个：写入 {report.chunks_written} 个 chunk，"
-            f"复用 {report.chunks_reused} 个"
+    if len(report.targets) > 1:
+        for tr in report.targets:
+            if tr.skipped:
+                lines.append(_line(f"  [{tr.name}] 跳过（没有可用的 set）", RColor.gray))
+                continue
+            lines.append(
+                _line(
+                    f"  [{tr.name}] 写 {tr.applied} / 删 {tr.deleted} / 失败 {tr.failed}"
+                    f" / {_mb(tr.bytes_written)}",
+                    RColor.gray,
+                )
+            )
+    else:
+        detail = (
+            f"  内容未变（仅更新索引）{report.unchanged_after_hash}，"
+            f"目录 {report.dirs}，延后 {report.deferred}，失败 {report.failed}"
         )
-    lines.append(_line(detail, RColor.gray))
+        if report.regions_delta:
+            detail += (
+                f"\n  region 增量 {report.regions_delta} 个：写入 {report.chunks_written} 个 chunk，"
+                f"复用 {report.chunks_reused} 个"
+            )
+        lines.append(_line(detail, RColor.gray))
+
     if report.cancelled:
         lines.append(_line("  本轮被取消，已完成的部分保持原样，下一轮会继续收敛。", RColor.yellow))
     for failure in report.failures[:5]:
@@ -163,6 +190,8 @@ def _help(plugin, source: CommandSource) -> None:
         _line("!!mu sync [--dry-run] [--full] [--force]   执行一次同步", RColor.gray),
         _line("!!mu diff                                  只规划不执行（摘要）", RColor.gray),
         _line("!!mu status                                查看索引/上次同步/待重试", RColor.gray),
+        _line("!!mu verify [--deep]                       校验源/索引/镜像是否一致", RColor.gray),
+        _line("!!mu history [条数]                        查看最近的同步记录", RColor.gray),
         _line("!!mu cancel                                取消进行中的同步", RColor.gray),
         _line("!!mu schedule on|off                       开关自动同步", RColor.gray),
         _line("!!mu schedule set <时长，如 30m/2h/3d>     设置自动同步间隔（上限 7 天）", RColor.gray),
@@ -179,6 +208,60 @@ def _sync(plugin, source: CommandSource, raw: str = "") -> None:
 
 def _diff(plugin, source: CommandSource) -> None:
     plugin.start_sync(source, dry_run=True)
+
+
+def render_verify(report) -> RTextList:
+    head_color = RColor.green if report.ok() else RColor.yellow
+    lines = [
+        _line(
+            f"[{APP_NAME}] 校验完成（{'深校验' if report.deep else '浅校验'}）："
+            f"检查 {report.files_checked} 文件 / {_mb(report.bytes_checked)}，"
+            f"问题 {len(report.issues)} 项，耗时 {report.duration:.2f}s",
+            head_color,
+        )
+    ]
+    for issue in report.issues[:10]:
+        lines.append(_line(f"  ✗ {issue.line()}", RColor.red))
+    if len(report.issues) > 10:
+        lines.append(_line(f"  …… 另有 {len(report.issues) - 10} 项", RColor.red))
+    for warning in report.warnings[:5]:
+        lines.append(_line(f"  ! {warning}", RColor.yellow))
+    if report.ok():
+        lines.append(_line("  源、索引、镜像一致。", RColor.gray))
+    return _join(lines)
+
+
+def _verify(plugin, source: CommandSource, raw: str = "") -> None:
+    deep = "--deep" in (raw or "")
+    plugin.start_verify(source, deep=deep)
+
+
+def _history(plugin, source: CommandSource, raw: str = "") -> None:
+    limit = 10
+    token = (raw or "").strip()
+    if token:
+        try:
+            limit = max(1, min(50, int(token)))
+        except ValueError:
+            source.reply(_line(f"看不懂的数量：{token!r}（示例：!!mu history 20）", RColor.red))
+            return
+    records = plugin.history(limit)
+    if not records:
+        source.reply(_line("还没有同步历史。", RColor.gray))
+        return
+    lines = [_line(f"{APP_NAME} 最近 {len(records)} 次同步", RColor.aqua)]
+    for record in records:
+        when = time.strftime("%m-%d %H:%M:%S", time.localtime(int(record.get("finished_at", 0)) / 1000))
+        mark = "✓" if record.get("ok") else "✗"
+        color = RColor.gray if record.get("ok") else RColor.yellow
+        lines.append(
+            _line(
+                f"  {mark} {when} [{record.get('target', '?')}] {record.get('trigger', '?')}"
+                f" {record.get('summary', '')}（{record.get('duration', 0)}s）",
+                color,
+            )
+        )
+    source.reply(_join(lines))
 
 
 def _status(plugin, source: CommandSource) -> None:
@@ -275,6 +358,14 @@ def register(server, plugin) -> None:
 
     root.then(Literal("diff").requires(perm_2, msg_2).runs(lambda src: _diff(plugin, src)))
     root.then(Literal("status").runs(lambda src: _status(plugin, src)))
+
+    verify = Literal("verify").requires(perm_2, msg_2).runs(lambda src: _verify(plugin, src))
+    verify.then(GreedyText("options").runs(lambda src, ctx: _verify(plugin, src, ctx["options"])))
+    root.then(verify)
+
+    history = Literal("history").runs(lambda src: _history(plugin, src))
+    history.then(GreedyText("limit").runs(lambda src, ctx: _history(plugin, src, ctx["limit"])))
+    root.then(history)
     root.then(Literal("cancel").requires(perm_2, msg_2).runs(lambda src: _cancel(plugin, src)))
     root.then(
         Literal("reload")

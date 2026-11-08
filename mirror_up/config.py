@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import CONFIG_FILENAME, SCHEMA_VERSION
 
+DEFAULT_TARGET_ROOT = "./Mirror/server"
+
 DEFAULT_EXCLUDE: List[str] = [
     "**/session.lock",
     "**/*.lock",
@@ -35,6 +37,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mtime_precision_sec": 0,
     },
     "target": {"root": "./Mirror/server"},
+    "targets": [{"name": "default", "root": "./Mirror/server", "enabled": True}],
     "sets": [
         {"name": "world", "source": "world", "target": "world", "enabled": True, "mode": "strict"},
         {"name": "mods", "source": "mods", "target": "mods", "enabled": True, "mode": "strict"},
@@ -49,6 +52,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "region_write_mode": "inplace",
         "region_compaction_ratio": 0.5,
         "journal": True,
+        "clean_mcc_orphans": True,
         "max_retry": 3,
         "defer_unstable": True,
     },
@@ -67,6 +71,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "adapter": "manual",
         "rcon": {"host": "127.0.0.1", "port": 25575, "password": ""},
         "external": {"stop_cmd": "", "start_cmd": "", "probe_cmd": ""},
+        "mcsm": {
+            "base_url": "http://127.0.0.1:23333",
+            "apikey": "",
+            "uuid": "",
+            "remote_uuid": "",
+            "username": "",
+            "password": "",
+            "timeout_sec": 10,
+            "insecure_tls": False,
+        },
         "stop_timeout_sec": 120,
         "start_after_sync": True,
         "wait_ready_timeout_sec": 180,
@@ -109,7 +123,12 @@ class SourceConfig:
 
 @dataclass
 class TargetConfig:
+    """一个镜像目标。``mirror_control`` 为空时继承全局配置。"""
+
+    name: str = "default"
     root: str = "./Mirror/server"
+    enabled: bool = True
+    mirror_control: Optional["MirrorControlConfig"] = None
 
 
 @dataclass
@@ -132,6 +151,8 @@ class SyncConfig:
     region_write_mode: str = "inplace"
     region_compaction_ratio: float = 0.5
     journal: bool = True
+    #: 目标上不再被任何 region 引用的 ``.mcc`` 外置 chunk 是否删除。
+    clean_mcc_orphans: bool = True
     max_retry: int = 3
     defer_unstable: bool = True
 
@@ -166,10 +187,29 @@ class ExternalConfig:
 
 
 @dataclass
+class McsmConfig:
+    """MCSManager 面板控制参数。
+
+    MCSM 9 用 ``apikey`` 走查询参数；MCSM 10 用 ``username/password`` 登录拿
+    token，再放到 ``Authorization: Bearer``。两种都配了时优先 apikey。
+    """
+
+    base_url: str = "http://127.0.0.1:23333"
+    apikey: str = ""
+    uuid: str = ""
+    remote_uuid: str = ""
+    username: str = ""
+    password: str = ""
+    timeout_sec: int = 10
+    insecure_tls: bool = False
+
+
+@dataclass
 class MirrorControlConfig:
     adapter: str = "manual"
     rcon: RconConfig = field(default_factory=RconConfig)
     external: ExternalConfig = field(default_factory=ExternalConfig)
+    mcsm: McsmConfig = field(default_factory=McsmConfig)
     stop_timeout_sec: int = 120
     start_after_sync: bool = True
     wait_ready_timeout_sec: int = 180
@@ -210,7 +250,9 @@ class Config:
     schema_version: int = SCHEMA_VERSION
     role: str = "driver"
     source: SourceConfig = field(default_factory=SourceConfig)
+    #: 兼容 v0.4 及更早的单一目标写法；始终等于 ``targets[0]``。
     target: TargetConfig = field(default_factory=TargetConfig)
+    targets: List[TargetConfig] = field(default_factory=list)
     sets: List[SetConfig] = field(default_factory=list)
     exclude: List[str] = field(default_factory=list)
     sync: SyncConfig = field(default_factory=SyncConfig)
@@ -225,6 +267,15 @@ class Config:
 
     def enabled_sets(self) -> List[SetConfig]:
         return [s for s in self.sets if s.enabled]
+
+    def enabled_targets(self) -> List[TargetConfig]:
+        """启用的镜像目标；老配置没有 targets 时退化为单一 target。"""
+        if not self.targets:
+            return [self.target] if self.target.enabled else []
+        return [t for t in self.targets if t.enabled]
+
+    def control_for(self, target: TargetConfig) -> MirrorControlConfig:
+        return target.mirror_control or self.mirror_control
 
 
 # --------------------------------------------------------------------------- #
@@ -305,6 +356,84 @@ def _parse_set(raw: Any, index: int) -> SetConfig:
     )
 
 
+def _parse_control(raw: Any) -> MirrorControlConfig:
+    """解析停服策略（全局段与每个目标各自的覆盖段共用）。"""
+    control_raw = _as_dict(raw)
+    rcon_raw = _as_dict(control_raw.get("rcon"))
+    external_raw = _as_dict(control_raw.get("external"))
+    mcsm_raw = _as_dict(control_raw.get("mcsm"))
+    return MirrorControlConfig(
+        adapter=_as_str(control_raw.get("adapter"), "manual"),
+        rcon=RconConfig(
+            host=_as_str(rcon_raw.get("host"), "127.0.0.1"),
+            port=_as_int(rcon_raw.get("port"), 25575),
+            password=_as_str(rcon_raw.get("password"), ""),
+        ),
+        external=ExternalConfig(
+            stop_cmd=_as_str(external_raw.get("stop_cmd"), ""),
+            start_cmd=_as_str(external_raw.get("start_cmd"), ""),
+            probe_cmd=_as_str(external_raw.get("probe_cmd"), ""),
+        ),
+        mcsm=McsmConfig(
+            base_url=_as_str(mcsm_raw.get("base_url"), "http://127.0.0.1:23333").rstrip("/"),
+            apikey=_as_str(mcsm_raw.get("apikey"), ""),
+            uuid=_as_str(mcsm_raw.get("uuid"), ""),
+            remote_uuid=_as_str(mcsm_raw.get("remote_uuid"), ""),
+            username=_as_str(mcsm_raw.get("username"), ""),
+            password=_as_str(mcsm_raw.get("password"), ""),
+            timeout_sec=max(1, _as_int(mcsm_raw.get("timeout_sec"), 10)),
+            insecure_tls=_as_bool(mcsm_raw.get("insecure_tls"), False),
+        ),
+        stop_timeout_sec=max(1, _as_int(control_raw.get("stop_timeout_sec"), 120)),
+        start_after_sync=_as_bool(control_raw.get("start_after_sync"), True),
+        wait_ready_timeout_sec=max(1, _as_int(control_raw.get("wait_ready_timeout_sec"), 180)),
+        notify_players_sec=max(0, _as_int(control_raw.get("notify_players_sec"), 10)),
+    )
+
+
+def _parse_targets(raw: Dict[str, Any], legacy_raw: Dict[str, Any]) -> List[TargetConfig]:
+    """``targets`` 数组，兼容旧配置里单一的 ``target`` 对象。"""
+    items = raw.get("targets")
+    if items is None:
+        return [
+            TargetConfig(
+                name="default",
+                root=_as_str(legacy_raw.get("root"), "./Mirror/server"),
+                enabled=True,
+                mirror_control=None,
+            )
+        ]
+    if not isinstance(items, list) or not items:
+        raise ConfigError("targets 必须是非空数组")
+    targets: List[TargetConfig] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ConfigError(f"targets[{i}] 必须是对象")
+        name = _as_str(item.get("name"), f"target{i + 1}").strip() or f"target{i + 1}"
+        control_raw = item.get("mirror_control")
+        targets.append(
+            TargetConfig(
+                name=name,
+                root=_as_str(item.get("root"), "./Mirror/server"),
+                enabled=_as_bool(item.get("enabled"), True),
+                mirror_control=_parse_control(control_raw) if control_raw is not None else None,
+            )
+        )
+
+    # 兼容“只改了 target.root 没动 targets”的 v0.4 配置：默认生成的那个
+    # targets[0] 如果没被用户改过，而 legacy target.root 改过，就以 legacy 为准。
+    legacy_root = _as_str(legacy_raw.get("root"), "").strip()
+    if (
+        len(targets) == 1
+        and targets[0].name == "default"
+        and legacy_root
+        and legacy_root != targets[0].root
+        and targets[0].root == DEFAULT_TARGET_ROOT
+    ):
+        targets[0].root = legacy_root
+    return targets
+
+
 def parse_config(raw: Dict[str, Any]) -> Config:
     """把 JSON dict 解析为强类型 Config。缺失字段一律取默认值。"""
     if not isinstance(raw, dict):
@@ -313,6 +442,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
     source_raw = _as_dict(raw.get("source"))
     agent_raw = _as_dict(source_raw.get("agent"))
     target_raw = _as_dict(raw.get("target"))
+    targets = _parse_targets(raw, target_raw)
     sync_raw = _as_dict(raw.get("sync"))
     flush_raw = _as_dict(raw.get("source_flush"))
     control_raw = _as_dict(raw.get("mirror_control"))
@@ -351,7 +481,8 @@ def parse_config(raw: Dict[str, Any]) -> Config:
             ),
             mtime_precision_sec=max(0, _as_int(source_raw.get("mtime_precision_sec"), 0)),
         ),
-        target=TargetConfig(root=_as_str(target_raw.get("root"), "./Mirror/server")),
+        target=targets[0],
+        targets=targets,
         sets=sets,
         exclude=exclude,
         sync=SyncConfig(
@@ -363,6 +494,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
             region_write_mode=_as_str(sync_raw.get("region_write_mode"), "inplace"),
             region_compaction_ratio=_as_float(sync_raw.get("region_compaction_ratio"), 0.5),
             journal=_as_bool(sync_raw.get("journal"), True),
+        clean_mcc_orphans=_as_bool(sync_raw.get("clean_mcc_orphans"), True),
             max_retry=max(1, _as_int(sync_raw.get("max_retry"), 3)),
             defer_unstable=_as_bool(sync_raw.get("defer_unstable"), True),
         ),
@@ -376,23 +508,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
             saved_regex=_as_str(flush_raw.get("saved_regex"), "^Saved the game$"),
             timeout_sec=max(1, _as_int(flush_raw.get("timeout_sec"), 60)),
         ),
-        mirror_control=MirrorControlConfig(
-            adapter=_as_str(control_raw.get("adapter"), "manual"),
-            rcon=RconConfig(
-                host=_as_str(_as_dict(control_raw.get("rcon")).get("host"), "127.0.0.1"),
-                port=_as_int(_as_dict(control_raw.get("rcon")).get("port"), 25575),
-                password=_as_str(_as_dict(control_raw.get("rcon")).get("password"), ""),
-            ),
-            external=ExternalConfig(
-                stop_cmd=_as_str(_as_dict(control_raw.get("external")).get("stop_cmd"), ""),
-                start_cmd=_as_str(_as_dict(control_raw.get("external")).get("start_cmd"), ""),
-                probe_cmd=_as_str(_as_dict(control_raw.get("external")).get("probe_cmd"), ""),
-            ),
-            stop_timeout_sec=max(1, _as_int(control_raw.get("stop_timeout_sec"), 120)),
-            start_after_sync=_as_bool(control_raw.get("start_after_sync"), True),
-            wait_ready_timeout_sec=max(1, _as_int(control_raw.get("wait_ready_timeout_sec"), 180)),
-            notify_players_sec=max(0, _as_int(control_raw.get("notify_players_sec"), 10)),
-        ),
+        mirror_control=_parse_control(control_raw),
         schedule=ScheduleConfig(
             auto_sync=_as_bool(schedule_raw.get("auto_sync"), False),
             interval_seconds=max(60, _as_int(schedule_raw.get("interval_seconds"), 3600)),
@@ -524,7 +640,12 @@ def source_root(cfg: Config, base: Path) -> Path:
 
 
 def target_root(cfg: Config, base: Path) -> Path:
-    return resolve_path(cfg.target.root, base)
+    """第一个（或唯一）镜像目标的根目录；多目标请用 ``target_path``。"""
+    return target_path(cfg.enabled_targets()[0] if cfg.enabled_targets() else cfg.target, base)
+
+
+def target_path(target: TargetConfig, base: Path) -> Path:
+    return resolve_path(target.root, base)
 
 
 def set_source_path(cfg: Config, item: SetConfig, base: Path) -> Path:
@@ -532,7 +653,11 @@ def set_source_path(cfg: Config, item: SetConfig, base: Path) -> Path:
 
 
 def set_target_path(cfg: Config, item: SetConfig, base: Path) -> Path:
-    return resolve_path(item.target, target_root(cfg, base))
+    return set_target_path_in(cfg, cfg.enabled_targets()[0] if cfg.enabled_targets() else cfg.target, item, base)
+
+
+def set_target_path_in(cfg: Config, target: TargetConfig, item: SetConfig, base: Path) -> Path:
+    return resolve_path(item.target, target_path(target, base))
 
 
 def _is_within(child: Path, parent: Path) -> bool:
@@ -551,9 +676,27 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
         raise ConfigError(f"role 只能是 driver / exporter，当前为 {cfg.role!r}")
 
     src = source_root(cfg, base)
-    dst = target_root(cfg, base)
-    if _is_within(src, dst) or _is_within(dst, src):
-        raise ConfigError(f"source.root 与 target.root 不能互相包含：{src} / {dst}")
+    all_targets = cfg.targets or [cfg.target]
+    enabled_targets = cfg.enabled_targets()
+    if not enabled_targets:
+        raise ConfigError("没有启用任何镜像目标（targets 全部 enabled=false）")
+
+    seen_names = set()
+    seen_roots = set()
+    for target in all_targets:
+        if not target.name.strip():
+            raise ConfigError("targets[].name 不能为空")
+        if target.name in seen_names:
+            raise ConfigError(f"target 名称重复：{target.name!r}")
+        seen_names.add(target.name)
+        dst = target_path(target, base)
+        key = os.path.normcase(str(dst))
+        if key in seen_roots:
+            raise ConfigError(f"多个 target 指向同一目录：{dst}")
+        seen_roots.add(key)
+        if _is_within(src, dst) or _is_within(dst, src):
+            raise ConfigError(f"source.root 与 target {target.name!r} 不能互相包含：{src} / {dst}")
+
     if cfg.source.transport not in ("local", "agent"):
         raise ConfigError(f"source.transport 只能是 local / agent，当前为 {cfg.source.transport!r}")
     if cfg.source.transport == "agent":
@@ -577,15 +720,20 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
         warnings.append(f"源端为 agent（{cfg.source.agent.url}），不同步本地 {src}")
 
     names = set()
-    targets = set()
     for item in cfg.sets:
         if item.name in names:
             raise ConfigError(f"set 名称重复：{item.name!r}")
         names.add(item.name)
-        target_path = set_target_path(cfg, item, base).as_posix()
-        if target_path in targets:
-            raise ConfigError(f"两个 set 指向同一 target：{item.target!r}")
-        targets.add(target_path)
+
+    for target in enabled_targets:
+        seen_paths = set()
+        for item in cfg.enabled_sets():
+            dst_key = set_target_path_in(cfg, target, item, base).as_posix()
+            if dst_key in seen_paths:
+                raise ConfigError(
+                    f"target {target.name!r} 上两个 set 指向同一目录：{item.target!r}"
+                )
+            seen_paths.add(dst_key)
 
     for item in cfg.enabled_sets():
         set_src = set_source_path(cfg, item, base)
@@ -599,18 +747,32 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
     if not cfg.enabled_sets():
         warnings.append("没有任何启用的 set，同步将什么都不做")
 
-    if cfg.mirror_control.adapter not in ("manual", "rcon", "external", "mcsm"):
-        raise ConfigError(f"未知的 mirror_control.adapter：{cfg.mirror_control.adapter!r}")
-    if cfg.mirror_control.adapter == "rcon":
-        if not cfg.mirror_control.rcon.password:
-            warnings.append("mirror_control.adapter=rcon 但 rcon.password 为空，停服命令会失败")
-    elif cfg.mirror_control.adapter == "external":
-        if not cfg.mirror_control.external.stop_cmd:
-            warnings.append("mirror_control.adapter=external 但 stop_cmd 为空，无法自动停镜像")
-        if not cfg.mirror_control.external.start_cmd and cfg.mirror_control.start_after_sync:
-            warnings.append("start_after_sync=true 但 external.start_cmd 为空，同步后不会自动启动")
-    elif cfg.mirror_control.adapter == "mcsm":
-        warnings.append("mirror_control.adapter=mcsm 尚未实现，当前按 manual 处理（只检查、不操作）")
+    def check_control(control: MirrorControlConfig, label: str) -> None:
+        if control.adapter not in ("manual", "rcon", "external", "mcsm"):
+            raise ConfigError(f"未知的 {label}mirror_control.adapter：{control.adapter!r}")
+        if control.adapter == "rcon":
+            if not control.rcon.password:
+                warnings.append(f"{label}mirror_control.adapter=rcon 但 rcon.password 为空，停服命令会失败")
+        elif control.adapter == "external":
+            if not control.external.stop_cmd:
+                warnings.append(f"{label}mirror_control.adapter=external 但 stop_cmd 为空，无法自动停镜像")
+            if not control.external.start_cmd and control.start_after_sync:
+                warnings.append(f"{label}start_after_sync=true 但 external.start_cmd 为空，同步后不会自动启动")
+        elif control.adapter == "mcsm":
+            mcsm = control.mcsm
+            if not mcsm.base_url.startswith(("http://", "https://")):
+                warnings.append(f"{label}mirror_control.mcsm.base_url 必须以 http:// 或 https:// 开头")
+            if not mcsm.uuid or not mcsm.remote_uuid:
+                warnings.append(f"{label}mirror_control.mcsm 需要 uuid 与 remote_uuid，否则无法定位实例")
+            if not mcsm.apikey and not (mcsm.username and mcsm.password):
+                warnings.append(
+                    f"{label}mirror_control.mcsm 需要 apikey（MCSM 9）或 username+password（MCSM 10），否则无法停服"
+                )
+
+    check_control(cfg.mirror_control, "")
+    for target in enabled_targets:
+        if target.mirror_control is not None:
+            check_control(target.mirror_control, f"target {target.name!r} 的 ")
 
     if cfg.role == "exporter" and len(cfg.agent_server.token or "") < 16:
         warnings.append(
@@ -624,6 +786,47 @@ def validate_config(cfg: Config, base: Path) -> List[str]:
 # --------------------------------------------------------------------------- #
 # 写回（命令修改 schedule 等需要落盘）
 # --------------------------------------------------------------------------- #
+
+
+def _control_to_dict(control: MirrorControlConfig) -> Dict[str, Any]:
+    return {
+        "adapter": control.adapter,
+        "rcon": {
+            "host": control.rcon.host,
+            "port": control.rcon.port,
+            "password": control.rcon.password,
+        },
+        "external": {
+            "stop_cmd": control.external.stop_cmd,
+            "start_cmd": control.external.start_cmd,
+            "probe_cmd": control.external.probe_cmd,
+        },
+        "mcsm": {
+            "base_url": control.mcsm.base_url,
+            "apikey": control.mcsm.apikey,
+            "uuid": control.mcsm.uuid,
+            "remote_uuid": control.mcsm.remote_uuid,
+            "username": control.mcsm.username,
+            "password": control.mcsm.password,
+            "timeout_sec": control.mcsm.timeout_sec,
+            "insecure_tls": control.mcsm.insecure_tls,
+        },
+        "stop_timeout_sec": control.stop_timeout_sec,
+        "start_after_sync": control.start_after_sync,
+        "wait_ready_timeout_sec": control.wait_ready_timeout_sec,
+        "notify_players_sec": control.notify_players_sec,
+    }
+
+
+def _target_to_dict(target: TargetConfig) -> Dict[str, Any]:
+    data: Dict[str, Any] = {
+        "name": target.name,
+        "root": target.root,
+        "enabled": target.enabled,
+    }
+    if target.mirror_control is not None:
+        data["mirror_control"] = _control_to_dict(target.mirror_control)
+    return data
 
 
 def config_to_dict(cfg: Config) -> Dict[str, Any]:
@@ -642,6 +845,7 @@ def config_to_dict(cfg: Config) -> Dict[str, Any]:
             "mtime_precision_sec": cfg.source.mtime_precision_sec,
         },
         "target": {"root": cfg.target.root},
+        "targets": [_target_to_dict(t) for t in (cfg.targets or [cfg.target])],
         "sets": [
             {
                 "name": item.name,
@@ -662,6 +866,7 @@ def config_to_dict(cfg: Config) -> Dict[str, Any]:
             "region_write_mode": cfg.sync.region_write_mode,
             "region_compaction_ratio": cfg.sync.region_compaction_ratio,
             "journal": cfg.sync.journal,
+        "clean_mcc_orphans": cfg.sync.clean_mcc_orphans,
             "max_retry": cfg.sync.max_retry,
             "defer_unstable": cfg.sync.defer_unstable,
         },
@@ -672,23 +877,7 @@ def config_to_dict(cfg: Config) -> Dict[str, Any]:
             "saved_regex": cfg.source_flush.saved_regex,
             "timeout_sec": cfg.source_flush.timeout_sec,
         },
-        "mirror_control": {
-            "adapter": cfg.mirror_control.adapter,
-            "rcon": {
-                "host": cfg.mirror_control.rcon.host,
-                "port": cfg.mirror_control.rcon.port,
-                "password": cfg.mirror_control.rcon.password,
-            },
-            "external": {
-                "stop_cmd": cfg.mirror_control.external.stop_cmd,
-                "start_cmd": cfg.mirror_control.external.start_cmd,
-                "probe_cmd": cfg.mirror_control.external.probe_cmd,
-            },
-            "stop_timeout_sec": cfg.mirror_control.stop_timeout_sec,
-            "start_after_sync": cfg.mirror_control.start_after_sync,
-            "wait_ready_timeout_sec": cfg.mirror_control.wait_ready_timeout_sec,
-            "notify_players_sec": cfg.mirror_control.notify_players_sec,
-        },
+        "mirror_control": _control_to_dict(cfg.mirror_control),
         "schedule": {
             "auto_sync": cfg.schedule.auto_sync,
             "interval_seconds": cfg.schedule.interval_seconds,

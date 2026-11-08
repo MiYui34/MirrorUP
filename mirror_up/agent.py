@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import ssl
+import stat as stat_module
 import sys
 import threading
 from http import HTTPStatus
@@ -34,6 +35,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import Config, load_config, set_source_path
 from .constants import APP_NAME, VERSION, IO_CHUNK
 from .excludes import GlobMatcher
+from .hashing import hash_file
 from .leveldat import read_level_info
 from .region import RegionExternalChunk, RegionFormatError, parse_header, read_record, scan_region
 from .scanner import scan_tree
@@ -226,6 +228,7 @@ def _make_handler(server: AgentServer):
                     "/v1/info": self._info,
                     "/v1/manifest": self._manifest,
                     "/v1/file": self._file,
+                    "/v1/hash": self._hash,
                     "/v1/stat": self._stat,
                     "/v1/region": self._region,
                     "/v1/region/chunks": self._chunks,
@@ -299,6 +302,31 @@ def _make_handler(server: AgentServer):
                 "size": 0 if path.is_dir() else st.st_size,
                 "mtime_ns": st.st_mtime_ns,
                 "is_dir": path.is_dir(),
+            }
+            self._send_bytes(
+                json.dumps(payload).encode("utf-8"),
+                content_type="application/json; charset=utf-8",
+            )
+
+        def _hash(self, query: Dict[str, str]) -> None:
+            """源端算哈希，供 driver 做深校验（不传输文件内容）。"""
+            name = query.get("set", "")
+            rel = query.get("path", "")
+            path = self.server_ctx.resolve(name, rel)
+            try:
+                st = os.stat(path)
+            except FileNotFoundError as exc:
+                raise AgentError(HTTPStatus.NOT_FOUND, f"文件不存在：{rel}") from exc
+            if not stat_module.S_ISREG(st.st_mode):
+                raise AgentError(HTTPStatus.BAD_REQUEST, f"不是普通文件：{rel}")
+            try:
+                digest = hash_file(path)
+            except OSError as exc:
+                raise AgentError(HTTPStatus.FORBIDDEN, f"无法读取：{exc}") from exc
+            payload = {
+                "hash": digest.hex(),
+                "size": st.st_size,
+                "mtime_ns": st.st_mtime_ns,
             }
             self._send_bytes(
                 json.dumps(payload).encode("utf-8"),

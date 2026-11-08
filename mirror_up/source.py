@@ -31,7 +31,7 @@ from urllib.parse import urlencode, urlparse
 from .config import AgentConfig, Config, SetConfig, set_source_path
 from .constants import IO_CHUNK
 from .excludes import GlobMatcher
-from .hashing import new_hasher
+from .hashing import hash_file, new_hasher
 from .region import (
     ChunkDelta,
     RegionScan,
@@ -86,6 +86,13 @@ class Source:
         raise NotImplementedError
 
     def copy_to(self, rel: str, dst: Path) -> Tuple[bytes, int, int]:  # pragma: no cover
+        raise NotImplementedError
+
+    def digest(self, rel: str) -> Optional[Tuple[bytes, int, int]]:
+        """只算哈希、不落盘：``(hash, size, mtime_ns)``，文件不存在返回 None。
+
+        深校验用。跨机时由 agent 在源端计算，不产生文件传输。
+        """
         raise NotImplementedError
 
     def scan_region(
@@ -171,6 +178,19 @@ class LocalSource(Source):
                 f"{st1.st_size}B@{st1.st_mtime_ns}，实际读 {written}B）"
             )
         return hasher.digest(), written, st1.st_mtime_ns
+
+    def digest(self, rel: str) -> Optional[Tuple[bytes, int, int]]:
+        src = self.root.joinpath(*_as_rel(rel).split("/"))
+        try:
+            st = os.stat(src)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise SourceError(f"读取源文件失败：{rel}（{exc}）") from exc
+        try:
+            return hash_file(src), st.st_size, st.st_mtime_ns
+        except OSError as exc:
+            raise SourceError(f"读取源文件失败：{rel}（{exc}）") from exc
 
     def scan_region(
         self, rel: str, dirty_since: Optional[int], previous: Optional[Dict[int, bytes]]
@@ -360,6 +380,18 @@ class AgentSource(Source):
                 return resp.read(limit)
         except SourceVanished:
             return None
+
+    def digest(self, rel: str) -> Optional[Tuple[bytes, int, int]]:
+        rel = _as_rel(rel)
+        try:
+            data = self.client.get("/v1/hash", {"set": self.set_name, "path": rel})
+        except SourceVanished:
+            return None
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise SourceError(f"agent hash 返回非法 JSON：{exc}") from exc
+        return bytes.fromhex(payload["hash"]), int(payload["size"]), int(payload["mtime_ns"])
 
     # -- 文件 ----------------------------------------------------------- #
 
