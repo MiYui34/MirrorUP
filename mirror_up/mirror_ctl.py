@@ -279,7 +279,10 @@ class SelfMirrorControl(MirrorControl):
         if not sent:
             return False, "server.stop() 返回 False（服务器可能正在停止或未就绪）"
         if not self._poll(lambda: not self._server_running(), timeout):
-            return False, f"{timeout:.0f}s 内本服没有退出"
+            return False, (
+                f"{timeout:.0f}s 内本服没有退出——它可能不响应 stop 命令（被包装脚本接管、"
+                "卡在保存上，或者根本不是能被 MCDR 停止的服务端）。请手动关闭后再同步；本次不会写入任何文件。"
+            )
         self._wait_locks_free(min(timeout, 10.0))
         return True, "本服已停止"
 
