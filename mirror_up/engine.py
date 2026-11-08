@@ -42,7 +42,7 @@ from .index import KIND_DIR, KIND_FILE, FileRow, Index, WorldIdMismatch
 from .leveldat import read_level_info
 from .mirror_ctl import build_mirror_control
 from .planner import Op, OpKind, Plan, SetPlan, build_set_plan
-from .region import supports_delta
+from .region import recover_all_journals, supports_delta
 from .scanner import ScanResult, ScannedEntry, scan_tree
 
 logger = logging.getLogger("mirror_up")
@@ -212,7 +212,7 @@ class SyncEngine:
         return report
 
     def _run_inner(self, report: RoundReport, dry_run: bool, full: bool, force: bool) -> None:
-        contexts = self._prepare(report)
+        contexts = self._prepare(report, repair=not dry_run)
         self._check_cancel(report)
 
         snapshot_ns = time.time_ns()
@@ -265,7 +265,7 @@ class SyncEngine:
     # 准备
     # ------------------------------------------------------------------ #
 
-    def _prepare(self, report: RoundReport) -> List[SetContext]:
+    def _prepare(self, report: RoundReport, repair: bool = True) -> List[SetContext]:
         contexts: List[SetContext] = []
         for item in self.config.enabled_sets():
             src = set_source_path(self.config, item, self.base_dir)
@@ -278,11 +278,24 @@ class SyncEngine:
                 continue
             set_id = self.index.upsert_set(item.name, item.source, item.target)
             rows = self.index.load_files(set_id)
+            journal_dir = (
+                self.index.path.parent / "journal" / item.name
+                if self.config.sync.journal
+                else None
+            )
+            if repair and journal_dir is not None:
+                restored = recover_all_journals(journal_dir, dst.resolve())
+                if restored:
+                    report.warnings.append(
+                        f"set {item.name!r}：从 journal 恢复了 {restored} 个 region 的头"
+                        "（上次同步未正常结束，本轮会重做）"
+                    )
             applier = Applier(
                 set_name=item.name,
                 source_root=src.resolve(),
                 target_root=dst.resolve(),
                 sync=self.config.sync,
+                journal_dir=journal_dir,
             )
             contexts.append(
                 SetContext(
@@ -537,8 +550,11 @@ class SyncEngine:
                     FileRow(
                         path=op.path,
                         kind=KIND_FILE,
-                        size=result.size,
-                        mtime_ns=result.mtime_ns,
+                        # 索引记录的是**源端**状态：region 的 inplace 写入会让目标
+                        # 文件比源文件大（碎片扇区），用 result.* 会把目标尺寸记成
+                        # 源尺寸，下一轮误判“源变了”。
+                        size=op.size,
+                        mtime_ns=op.mtime_ns,
                         hash=result.digest,
                         region=is_region_name(Path(op.path).name),
                         synced_at=snapshot_ns,
@@ -557,8 +573,8 @@ class SyncEngine:
                 FileRow(
                     path=op.path,
                     kind=KIND_FILE,
-                    size=result.size,
-                    mtime_ns=result.mtime_ns,
+                    size=op.size,
+                    mtime_ns=op.mtime_ns,
                     hash=result.digest,
                     region=is_region_name(Path(op.path).name),
                     synced_at=snapshot_ns,

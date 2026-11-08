@@ -8,6 +8,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 - **chunk 级增量**：region 文件只看脏 chunk（时间戳过滤 + 哈希确认），未变的 chunk 直接复用。
 - **镜像纠偏**：镜像上被玩家改过的文件，下一轮会被发现并恢复。
 - **原子写入**：先写临时文件再替换，镜像上不会出现半个文件；写入失败下一轮自动重试。
+- **原地写 region**：`.mca` 默认 append-and-commit + 8KB 头 journal，一个 chunk 变了就只写它；碎片攒多了自动整理。
 - **定时同步**：间隔 60 秒 ~ 7 天，可随时开关。
 
 ## 安装
@@ -39,6 +40,8 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `sync.concurrency` | `4` | 并行拷贝数 |
 | `sync.verify_target` | `true` | 每轮检查镜像是否被改动 |
 | `sync.region_delta` | `true` | `.mca` 走 chunk 级增量，`false` 退回整文件 |
+| `sync.region_write_mode` | `inplace` | `inplace` 原地追加，`rebuild` 重建后替换 |
+| `sync.journal` | `true` | `inplace` 的 region 头快照；`false` 会降级为 `rebuild` |
 | `source_flush.enabled` | `true` | 扫描前 `save-off` + `save-all flush`，扫描后 `save-on` |
 | `schedule.interval_seconds` | `3600` | 自动同步间隔，60 ~ 604800 秒 |
 
@@ -62,7 +65,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 
 - **镜像必须完全停止才能同步**。插件用 `session.lock` 判断镜像是否在运行；检测到运行中会拒绝写入。
 - **不做备份**。镜像上被覆盖的区块和模组没有历史版本。
-- **写入量不等于读取量**。当前写入方式是"重建 region 文件再替换"，改动一个 chunk 时目标端仍会重写整个 region；省下来的是源端读取和跨机传输（把写入也压到 O(脏 chunk) 的 `inplace` 模式在计划中）。
+- **写入量不等于读取量**。`.mca` 默认 `inplace`，改动一个 chunk 时目标端只写这个 chunk 加 16KB（新头 + journal）；`rebuild` 模式才会重写整个 region。
 - **不覆盖配置文件**。`config/`、`server.properties` 不在默认同步范围内，手动加进去会覆盖镜像的配置。
 - **空源保护**。源目录扫出 0 个文件但索引里有记录（路径写错、磁盘没挂载）时会中止，不会清空镜像；确认要清空请加 `--force`。
 - **版本门禁**。源与镜像 `level.dat` 的 MC 版本不一致时拒绝写入。
@@ -77,7 +80,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 
 ## 版本
 
-当前 `0.2.0`：文件级 + chunk 级增量、镜像纠偏、定时同步、手动停服检查。
+当前 `0.3.0`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、手动停服检查。
 
 ## 许可证
 

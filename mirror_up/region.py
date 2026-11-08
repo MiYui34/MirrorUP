@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import shutil
@@ -289,6 +290,8 @@ class RegionWriteResult:
     chunks_dropped: int
     size: int
     mtime_ns: int
+    #: 本轮是否因碎片过多而退化成整文件重写
+    compacted: bool = False
 
 
 def build_header(entries: Dict[int, Tuple[int, int, int]]) -> bytes:
@@ -441,3 +444,289 @@ def fsync_dir(path: os.PathLike[str] | str) -> None:
         pass
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------- #
+# 头 journal：inplace 模式唯一的崩溃保护
+# ---------------------------------------------------------------------- #
+
+#: journal 文件格式：``MUJ1 | 4B 路径长度 | 路径 | 16B 头哈希 | 8192B 旧头``。
+JOURNAL_MAGIC = b"MUJ1"
+JOURNAL_SUFFIX = ".hdr"
+
+
+def journal_file(journal_dir: os.PathLike[str] | str, rel_path: str) -> Path:
+    """每个 region 一个 journal 文件，文件名由目标相对路径决定。"""
+    digest = hashlib.sha1(rel_path.encode("utf-8")).hexdigest()
+    return Path(journal_dir) / (digest + JOURNAL_SUFFIX)
+
+
+def write_journal(
+    journal_dir: os.PathLike[str] | str, rel_path: str, header: bytes
+) -> Path:
+    """把旧 8KB 头落盘（临时文件 + 原子替换 + fsync）。"""
+    if len(header) != HEADER_SIZE:
+        raise ValueError("journal 只接受完整的 8KB region 头")
+    path = journal_file(journal_dir, rel_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    raw_path = rel_path.encode("utf-8")
+    payload = bytearray(JOURNAL_MAGIC)
+    payload += struct.pack(">I", len(raw_path))
+    payload += raw_path
+    hasher = new_hasher()
+    hasher.update(header)
+    payload += hasher.digest()
+    payload += header
+
+    tmp = path.parent / f".{path.name}.{secrets.token_hex(4)}.tmp"
+    with open(tmp, "wb") as fp:
+        fp.write(bytes(payload))
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(tmp, path)
+    fsync_dir(path.parent)
+    return path
+
+
+def _read_journal(path: Path) -> Optional[Tuple[str, bytes]]:
+    """读取并校验 journal；损坏的 journal 返回 ``None``（调用方应删除）。"""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 8 + 16 + HEADER_SIZE or not raw.startswith(JOURNAL_MAGIC):
+        return None
+    (path_len,) = struct.unpack_from(">I", raw, 4)
+    if path_len <= 0 or path_len > 4096:
+        return None
+    start = 8
+    if start + path_len + 16 + HEADER_SIZE > len(raw):
+        return None
+    rel = raw[start : start + path_len].decode("utf-8", "replace")
+    if not rel or rel.startswith("/") or ".." in rel.split("/"):
+        return None
+    start += path_len
+    digest = raw[start : start + 16]
+    header = raw[start + 16 : start + 16 + HEADER_SIZE]
+    hasher = new_hasher()
+    hasher.update(header)
+    if hasher.digest() != digest:
+        return None
+    return rel, header
+
+
+def _restore_header(dst: Path, header: bytes) -> None:
+    with open(dst, "r+b") as fp:
+        fp.seek(0)
+        fp.write(header)
+        fp.flush()
+        os.fsync(fp.fileno())
+
+
+def recover_journal_at(
+    journal_dir: os.PathLike[str] | str,
+    rel_path: str,
+    dst_path: os.PathLike[str] | str,
+) -> bool:
+    """写这个 region 之前先看有没有上一轮残留的 journal；有就把旧头写回去。
+
+    ``inplace`` 只追加、不覆盖旧 chunk，所以旧头一旦恢复，文件立刻回到
+    “完整可读”的状态；本轮该做的修改会在后面正常重做（幂等）。
+    """
+    path = journal_file(journal_dir, rel_path)
+    if not path.exists():
+        return False
+    parsed = _read_journal(path)
+    dst = Path(dst_path)
+    restored = False
+    if parsed is not None and parsed[0] == rel_path and dst.exists():
+        try:
+            _restore_header(dst, parsed[1])
+            restored = True
+        except OSError:
+            return False  # 保留 journal，下一轮再试
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    fsync_dir(path.parent)
+    return restored
+
+
+def recover_all_journals(
+    journal_dir: os.PathLike[str] | str, target_root: os.PathLike[str] | str
+) -> int:
+    """启动时扫一遍 journal 目录，把残留的头全部恢复（返回恢复的文件数）。"""
+    root = Path(journal_dir)
+    if not root.is_dir():
+        return 0
+    base = Path(target_root)
+    restored = 0
+    for path in sorted(root.glob("*" + JOURNAL_SUFFIX)):
+        parsed = _read_journal(path)
+        if parsed is not None:
+            rel, header = parsed
+            dst = base.joinpath(*rel.split("/"))
+            if dst.exists():
+                try:
+                    _restore_header(dst, header)
+                    restored += 1
+                except OSError:
+                    continue  # 恢复不了就留着，下次再试
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    fsync_dir(root)
+    return restored
+
+
+# ---------------------------------------------------------------------- #
+# inplace：append-and-commit
+# ---------------------------------------------------------------------- #
+
+def _cleanup_tmp(dst: Path) -> None:
+    for stale in dst.parent.glob(f".{dst.name}.mirrorup-*.tmp"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def write_region_inplace(
+    scan: RegionScan,
+    dst_path: os.PathLike[str] | str,
+    previous: Optional[Dict[int, bytes]] = None,
+    force_full: bool = False,
+    compaction_ratio: float = 0.5,
+    journal_dir: Optional[os.PathLike[str] | str] = None,
+    rel_path: str = "",
+) -> RegionWriteResult:
+    """直接改目标文件：旧 chunk 原地保留，新 chunk 追加到末尾，最后提交 8KB 头。
+
+    不变式：
+
+    * 提交头之前**绝不覆盖旧 chunk 占用的扇区**，所以旧头始终指向完好数据；
+    * 新数据先 ``fsync``，再写 journal（旧头），最后才写新头；
+    * 头写到一半崩溃 → 下一轮用 journal 恢复旧头，region 回到完整状态；
+    * 文件只增不减，孤儿扇区超过 ``compaction_ratio`` 时整文件重建一次。
+
+    目标不存在、头结构不可信、或需要 compaction 时退回
+    :func:`write_region_delta`（原子替换，不写 journal）。
+    """
+    previous = previous or {}
+    dst = Path(dst_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    if journal_dir is not None:
+        recover_journal_at(journal_dir, rel_path, dst)
+
+    if force_full or not dst.exists():
+        return write_region_delta(scan, dst, previous, force_full=True)
+
+    try:
+        with open(dst, "rb") as fp:
+            size = os.fstat(fp.fileno()).st_size
+            if size < HEADER_SIZE:
+                raise RegionFormatError("目标 region 头不足 8KB")
+            origin_header = fp.read(HEADER_SIZE)
+        origin = parse_header(origin_header, size)
+    except (OSError, RegionFormatError):
+        return write_region_delta(scan, dst, previous, force_full=True)
+
+    _cleanup_tmp(dst)
+
+    total_sectors = (size + SECTOR_SIZE - 1) // SECTOR_SIZE
+    live_sectors = HEADER_SECTORS + sum(slot.sectors for slot in origin.values())
+    if total_sectors > live_sectors * (1.0 + max(0.0, float(compaction_ratio))):
+        result = write_region_delta(scan, dst, previous, force_full=True)
+        result.compacted = True
+        return result
+
+    entries: Dict[int, Tuple[int, int, int]] = {}
+    state: Dict[int, bytes] = {}
+    written = 0
+    end_sector = (size + SECTOR_SIZE - 1) // SECTOR_SIZE
+
+    with open(dst, "r+b") as fout, open(scan.path, "rb") as fin:
+        for index in sorted(scan.chunks):
+            chunk = scan.chunks[index]
+            prev = previous.get(index)
+            slot = origin.get(index)
+
+            unchanged = False
+            if chunk.digest is not None:
+                if chunk.read:
+                    unchanged = prev is not None and chunk.digest == prev
+                else:
+                    unchanged = True
+
+            if unchanged and slot is not None:
+                entries[index] = (slot.offset, slot.sectors, chunk.timestamp)
+                state[index] = chunk.digest  # type: ignore[assignment]
+                continue
+
+            # 需要从源端搬这条记录：校验“扫描时算的哈希 == 现在读到的字节”，
+            # 防止扫描与写入之间源端又改了一次，把不一致的内容写进镜像。
+            length, head, body = read_record(fin, chunk.as_slot())
+            digest = record_digest(head, body)
+            if chunk.digest is not None and chunk.digest != digest:
+                raise RegionUnstable(f"chunk {index} 在扫描与写入之间被改写：{scan.path}")
+            need = (4 + length + SECTOR_SIZE - 1) // SECTOR_SIZE
+            if need > MAX_SECTORS:
+                raise RegionFormatError(f"chunk {index} 记录过大：{length}B")
+
+            fout.seek(end_sector * SECTOR_SIZE)
+            fout.write(head)
+            fout.write(body)
+            padding = need * SECTOR_SIZE - (4 + length)
+            if padding > 0:
+                fout.write(b"\x00" * padding)
+
+            entries[index] = (end_sector, need, chunk.timestamp)
+            state[index] = digest
+            written += need * SECTOR_SIZE
+            end_sector += need
+
+        # 先把新数据落盘，再写 journal，最后才动头。
+        fout.flush()
+        os.fsync(fout.fileno())
+
+        journaled = False
+        if journal_dir is not None:
+            write_journal(journal_dir, rel_path, origin_header)
+            journaled = True
+
+        fout.seek(0)
+        fout.write(build_header(entries))
+        fout.flush()
+        os.fsync(fout.fileno())
+
+    if journaled:
+        try:
+            journal_file(journal_dir, rel_path).unlink()  # type: ignore[arg-type]
+        except OSError:
+            pass
+        fsync_dir(Path(journal_dir))  # type: ignore[arg-type]
+
+    stat = os.stat(dst)
+    logical = new_hasher()
+    for index in sorted(state):
+        logical.update(struct.pack(">H", index))
+        logical.update(state[index])
+
+    return RegionWriteResult(
+        logical=logical.digest(),
+        state=encode_state(state),
+        written_bytes=written + HEADER_SIZE + (HEADER_SIZE if journaled else 0),
+        chunks_written=len(entries) - sum(
+            1 for index in entries if index in origin and entries[index][0] == origin[index].offset
+        ),
+        chunks_reused=sum(
+            1 for index in entries if index in origin and entries[index][0] == origin[index].offset
+        ),
+        chunks_dropped=sum(1 for index in origin if index not in entries),
+        size=stat.st_size,
+        mtime_ns=stat.st_mtime_ns,
+    )

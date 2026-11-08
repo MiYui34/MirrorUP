@@ -377,7 +377,7 @@ def chunk_digest(f, offset, sectors):
 
 ### 8.4 目标侧写入：两种模式
 
-#### 模式 `rebuild`（v0.2 默认，最安全）
+#### 模式 `rebuild`（v0.3 之前的默认，最安全）
 
 把"目标现有 chunk + 源端变更 chunk"拼成一个新文件，原子替换：
 
@@ -426,7 +426,7 @@ os.replace(tmp, target)      # 同卷，元数据操作，原子
 
 删除时相反：先删 region 中的引用（或整个 region），再删 `.mcc`。
 
-> 注：v0.2 没有实现 `.mcc` 的增量，见 §8.6 第 4 条。
+> 注：v0.2 / v0.3 都没有实现 `.mcc` 的增量，见 §8.6 第 4 条。
 
 ### 8.6 v0.2 实现记录（与上文规范的差异）
 
@@ -440,6 +440,20 @@ v0.2 落地后，实现与 §8.3–§8.5 的差异如下。**以本节为准**�
 6. **校验只做三条硬规则**：`offset >= 2`、`1 <= sectors <= 255`、`(offset+sectors)*4096 <= file_size`；`文件大小 % 4096 == 0` 未强制（截断文件会在读记录时因越界被拒）。
 7. **读—复验**：读完所有脏 chunk 后复读 8KB 头并复 `stat`，任一变化抛 `RegionUnstable` 交给 applier 重试，与 §10.1 的乐观校验一致。
 8. **索引只存 chunk 哈希、不存 offset/sectors**：目标端布局独立于源端，每次写都按目标现有头决定落点（这是 §8.3"哈希不含填充"能成立的前提）。
+
+### 8.7 v0.3 实现记录（inplace / journal / compaction）
+
+v0.3 落地后，`inplace` 与 §8.4 的设计差异如下，**以本节为准**：
+
+1. **不做空闲扇区位图**：设计里的"在空闲区找位置"被简化为"一律追加到文件末尾"。因为不变式要求绝不覆盖正在替换的旧扇区，空闲区本来也只能用来说明碎片位置；而碎片回收交给 compaction 统一处理，运行时就不必维护位图。代价是每改一个 chunk 多占一个扇区，由 compaction 回收。
+2. **未变的 chunk 只搬位置表、不搬数据**：新头里照抄旧头的 `(offset, sectors)`，这些扇区原样不动。
+3. **写入顺序**：追加新 chunk 记录 → `fsync` → 写 journal（`os.replace` + `fsync`）→ 写新 8KB 头 → `fsync` → 删 journal。崩溃在"删 journal 之前"，下一轮恢复旧头并重做；崩溃在"删 journal 之后"，新头已提交，旧头不再被引用。
+4. **journal 文件**：`config/mirror_up/journal/<set>/<sha1(相对路径)>.hdr`，格式 `MUJ1 | 4B 路径长度 | 路径 | 16B 头哈希 | 8192B 旧头`。路径必须是 set 内相对路径，拒绝 `..` 与绝对路径（防止被改坏的文件指到 set 外）。
+5. **恢复时机**：每轮 `_prepare` 里、非 dry-run 时按 set 调 `recover_all_journals`，恢复条数作为 warning 报给用户；dry-run 不碰目标。
+6. **`written_bytes` 口径**：数据扇区 + 8192（新头）+ 8192（journal）。所以"只改一个 chunk"的一轮写量是 20480 字节，不是 4096。
+7. **compaction 条件**：`总扇区 > 存活扇区 * (1 + ratio)`（存活 = 2 个头扇区 + 各 chunk 占用），命中就走 `rebuild` 路径并标记 `compacted=True`，`!!mu` 报告里显示"（碎片整理）"。
+8. **降级**：`journal=false` → `inplace` 降级为 `rebuild` 并告警；目标不存在、目标头解析失败、镜像被外部改动（`force_write`）→ 直接走 `rebuild`。
+9. **仍未做**：`.mcc` 增量、RCON/external 启停（`.mcc` 仍整文件复制，`mirror_control` 仍是 manual）。
 
 ---
 
@@ -750,9 +764,9 @@ class MirrorControl(Protocol):
     "trust_mtime": true,                 // false = 每轮全量哈希（极慢，仅排障）
     "verify_target": true,               // 每轮 stat 扫描镜像，发现被改的文件就重推（D9）
     "region_delta": true,                // .mca 走 chunk 级增量（v0.2 已实现）；false 退回整文件
-    "region_write_mode": "rebuild",      // rebuild | inplace（inplace 是 v0.3）
-    "region_compaction_ratio": 0.5,
-    "journal": true,
+    "region_write_mode": "inplace",      // rebuild | inplace（inplace 从 v0.3 起是默认）
+    "region_compaction_ratio": 0.5,      // 碎片扇区 > 存活扇区 * 0.5 时整文件重建
+    "journal": true,                     // inplace 的头快照；false 会把写入模式降级为 rebuild
     "max_retry": 3,
     "defer_unstable": true               // 读不稳定的文件延后到下一轮，而不是整轮失败
   },
@@ -805,7 +819,7 @@ class MirrorControl(Protocol):
 - `schedule.interval_seconds` 超限直接 clamp 到 `max_interval_seconds` 并在控制台告警。
 - `source.root` 与 `target.root` 解析为绝对路径后**不允许互相包含**（防止把镜像目录同步进自己）。
 - `sets[].target` 重名 → 拒绝启动。
-- `region_write_mode=inplace` 属于 v0.3，一律降级为 `rebuild` 并告警；`region_delta` 从 v0.2 起真正生效（v0.1 打开只会告警并忽略）。
+- `region_write_mode=inplace` 从 v0.3 起可用且是默认；`journal=false` 时自动降级为 `rebuild` 并告警（没有头快照的 inplace 不提供崩溃保护）；`region_compaction_ratio < 0` 视为 0（只受"不缩小文件"限制，有碎片就整理）。`region_delta` 从 v0.2 起真正生效（v0.1 打开只会告警并忽略）。
 - 跨机时 `agent.url` 指向自身地址 → 拒绝（防止自我同步）。
 
 ---
@@ -937,7 +951,7 @@ class MirrorControl(Protocol):
 |---|---|---|
 | **v0.1** ✅ | 索引 + 文件级增量 + 读后复验（§10.1）+ 原子替换 + plan/dry-run + 排除清单 + 断点续传 + `manual` 适配器 | Profile B 稳态一轮 < 10 s；崩溃注入不产生损坏文件 |
 | **v0.2** 🚧 | region chunk 级增量（`rebuild`，已完成）+ chunk 读—复验（已完成）+ 定时（已完成）；`.mcc` 增量、RCON/external 启停**未做** | Profile B 稳态一轮 < 5 s；源端读取量下降一个数量级（目标端写入量不变，见 §8.6 第 2 条） |
-| **v0.3** | `inplace` append-and-commit + compaction + 头 journal | 写入量再降 5×；fuzz 与崩溃注入全通过 |
+| **v0.3** ✅ | `inplace` append-and-commit + compaction + 头 journal（§8.7）；`.mcc` 增量、RCON/external 启停仍在 v0.4 | 写量降到"脏 chunk + 16KB"，崩溃注入后靠 journal 恢复旧头 |
 | **v0.4** | 跨机 `agent` 传输 + TLS + 多镜像目标 | 同机/跨机结果一致；断网重连续传 |
 | **v0.5** | `verify`、同步历史、`!!mu status` 增强、Python API 对外开放 | 第三方插件可调用 |
 | 可选 | btrfs/zfs snapshot 加速后端、空闲触发、WebUI | — |

@@ -46,7 +46,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "trust_mtime": True,
         "verify_target": True,
         "region_delta": True,
-        "region_write_mode": "rebuild",
+        "region_write_mode": "inplace",
         "region_compaction_ratio": 0.5,
         "journal": True,
         "max_retry": 3,
@@ -129,7 +129,7 @@ class SyncConfig:
     #: 每轮花一次 stat 扫描检查镜像侧是否被改过（被改过就重推）。
     verify_target: bool = True
     region_delta: bool = True
-    region_write_mode: str = "rebuild"
+    region_write_mode: str = "inplace"
     region_compaction_ratio: float = 0.5
     journal: bool = True
     max_retry: int = 3
@@ -342,7 +342,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
             trust_mtime=_as_bool(sync_raw.get("trust_mtime"), True),
             verify_target=_as_bool(sync_raw.get("verify_target"), True),
             region_delta=_as_bool(sync_raw.get("region_delta"), True),
-            region_write_mode=_as_str(sync_raw.get("region_write_mode"), "rebuild"),
+            region_write_mode=_as_str(sync_raw.get("region_write_mode"), "inplace"),
             region_compaction_ratio=_as_float(sync_raw.get("region_compaction_ratio"), 0.5),
             journal=_as_bool(sync_raw.get("journal"), True),
             max_retry=max(1, _as_int(sync_raw.get("max_retry"), 3)),
@@ -427,6 +427,14 @@ def load_config(data_dir: Path) -> Tuple[Config, List[str]]:
                     "sync.region_delta 已打开（v0.2 起真正生效）；"
                     "如需退回整文件同步，请手动改回 false"
                 )
+        if 1 <= schema_version < 3:
+            sync_raw = raw.get("sync")
+            if isinstance(sync_raw, dict) and sync_raw.get("region_write_mode") in (None, "rebuild"):
+                sync_raw["region_write_mode"] = "inplace"
+                warnings.append(
+                    "v0.3 起 region 默认用 inplace 写入（只追加脏 chunk）；"
+                    "如需退回整文件替换，请把 sync.region_write_mode 改回 rebuild"
+                )
         merged = _deep_merge(DEFAULT_CONFIG, raw)
         merged["schema_version"] = SCHEMA_VERSION
         backup = path.with_suffix(".json.bak")
@@ -453,12 +461,17 @@ def _normalize(cfg: Config) -> List[str]:
             f"schedule.interval_seconds 超过上限，已 clamp 到 {cfg.schedule.max_interval_seconds} 秒"
         )
         cfg.schedule.interval_seconds = cfg.schedule.max_interval_seconds
-    if cfg.sync.region_write_mode == "inplace":
-        cfg.sync.region_write_mode = "rebuild"
-        warnings.append("region_write_mode=inplace 属于 v0.3，当前已按 rebuild 处理")
     if cfg.sync.region_write_mode not in ("rebuild", "inplace"):
         cfg.sync.region_write_mode = "rebuild"
         warnings.append("未知的 region_write_mode，已回退为 rebuild")
+    if cfg.sync.region_write_mode == "inplace" and not cfg.sync.journal:
+        cfg.sync.region_write_mode = "rebuild"
+        warnings.append(
+            "journal=false 时 inplace 没有崩溃保护，已回退为 rebuild；"
+            "要用 inplace 请把 journal 设回 true"
+        )
+    if cfg.sync.region_compaction_ratio < 0:
+        cfg.sync.region_compaction_ratio = 0.0
     if cfg.source.mtime_precision_sec and cfg.sync.trust_mtime:
         warnings.append("mtime_precision_sec > 0 时不建议信任 mtime，已自动关闭 trust_mtime")
         cfg.sync.trust_mtime = False

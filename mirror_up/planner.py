@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
+from .hashing import is_region_name
 from .index import KIND_DIR, KIND_FILE, FileRow
 from .scanner import ScanResult, ScannedEntry
 
@@ -277,7 +278,9 @@ def _target_diverged(
     target = target_entries.get(path)
     if target is None or target.kind != KIND_FILE:
         return "target-missing"
-    if target.size != entry.size:
+    # region 文件的大小取决于目标端的 chunk 排布（inplace 会多出碎片扇区），
+    # 不能拿源端大小去比；这类文件只靠 mtime 和时间窗口判断。
+    if not is_region_name(path.rsplit("/", 1)[-1]) and target.size != entry.size:
         return "target-size"
     if last_sync_end_ns and target.mtime_ns > last_sync_end_ns:
         return "target-touched"

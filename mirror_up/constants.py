@@ -1,4 +1,4 @@
-"""全局常量。"""
+﻿"""全局常量。"""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import re
 
 APP_ID = "mirror_up"
 APP_NAME = "MirrorUP"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 #: 索引与配置的 schema 版本，迁移时使用。
 #: v2：sync.region_delta 默认改为 true（v0.2 chunk 级增量真正生效）。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: 索引文件名（位于 MCDR 插件数据目录）。
 INDEX_FILENAME = "index.sqlite3"

@@ -37,6 +37,7 @@ from .region import (
     logical_digest,
     scan_region,
     write_region_delta,
+    write_region_inplace,
 )
 
 logger = logging.getLogger("mirror_up")
@@ -111,12 +112,14 @@ class Applier:
         target_root: Path,
         sync: SyncConfig,
         sleep: Callable[[float], None] = time.sleep,
+        journal_dir: Optional[Path] = None,
     ):
         self.set_name = set_name
         self.source_root = Path(source_root)
         self.target_root = Path(target_root)
         self.sync = sync
         self._sleep = sleep
+        self.journal_dir = Path(journal_dir) if journal_dir is not None else None
 
     # ------------------------------------------------------------------ #
     # 入口
@@ -169,19 +172,33 @@ class Applier:
                         region_state=encode_state(scan.digests()),
                     )
 
-                result = write_region_delta(
-                    scan,
-                    dst,
-                    previous=previous,
-                    force_full=op.force_write,
-                )
+                if self.sync.region_write_mode == "inplace":
+                    result = write_region_inplace(
+                        scan,
+                        dst,
+                        previous=previous,
+                        force_full=op.force_write,
+                        compaction_ratio=self.sync.region_compaction_ratio,
+                        journal_dir=self.journal_dir,
+                        rel_path=op.path,
+                    )
+                else:
+                    result = write_region_delta(
+                        scan,
+                        dst,
+                        previous=previous,
+                        force_full=op.force_write,
+                    )
                 return ApplyResult(
                     op=op,
                     status="applied",
                     digest=result.logical,
                     size=scan.size,
                     mtime_ns=scan.mtime_ns,
-                    detail=f"{result.chunks_written} chunk 写入 / {result.chunks_reused} 复用",
+                    detail=(
+                        f"{result.chunks_written} chunk 写入 / {result.chunks_reused} 复用"
+                        + ("（碎片整理）" if result.compacted else "")
+                    ),
                     region_state=result.state,
                     physical=result.written_bytes,
                     chunks_written=result.chunks_written,
