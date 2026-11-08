@@ -874,6 +874,7 @@ class MirrorControl(Protocol):         # v0.4 实际接口
 - `region_write_mode=inplace` 从 v0.3 起可用且是默认；`journal=false` 时自动降级为 `rebuild` 并告警（没有头快照的 inplace 不提供崩溃保护）；`region_compaction_ratio < 0` 视为 0（只受"不缩小文件"限制，有碎片就整理）。`region_delta` 从 v0.2 起真正生效（v0.1 打开只会告警并忽略）。
 - 跨机时 `agent.url` 指向自身地址 → 拒绝（防止自我同步）。
 - `source.transport=agent` 时 `source_flush.enabled` 被强制关闭并告警：driver 在另一台机器上，`save-off` / `save-all` 只会发给本机（镜像服），既刷新不了源端，还会关掉镜像服的自动保存。跨机时靠源服自己的定时保存，或同步前手动 `save-all flush`。
+- 有目标使用 `mirror_control.adapter=self` 时同样强制关闭并告警：本机服务器就是被写入的目标，flush 只会让同步在停服前白等一次。要在同步前落盘，请在**源服**上单独执行一次 `save-all flush`。
 - `source.transport` 只能是 `local` / `agent`，其他值直接 `ConfigError`；`agent` 模式下 `agent.url` 必须是 http(s)，不再检查本地 `source.root` 是否存在（那是 exporter 的事）。
 - `role=exporter` 时 `agent_server.token` 少于 16 字符 → 拒绝启动 agent；少于 32 字符 → 告警。
 - `mirror_control.adapter=rcon` 但 `rcon.password` 为空 → 告警（RCON 通常会拒绝登录）；`adapter=external` 缺 `stop_cmd` 或 `start_cmd` → 告警；`adapter=mcsm` 要求 `base_url` 为 http(s)、`uuid`/`remote_uuid` 必填、`apikey` 或 `username`+`password` 至少一组，否则告警。以上检查对全局配置与每个目标的覆盖段各跑一遍。

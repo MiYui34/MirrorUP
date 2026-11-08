@@ -627,6 +627,19 @@ def _normalize(cfg: Config) -> List[str]:
             "source.transport=agent 时 source_flush 不生效（save-off 只会发给本机），"
             "已自动关闭；请确保 exporter 那台机器的世界已经落盘"
         )
+    # 有目标用 self（就地同步）时，本机服务器正是要被写入的那一台：save-off 发给它
+    # 既刷新不了源端，还会让同步在停服前多等一次 flush。同样直接关掉。
+    uses_self = any(
+        (cfg.control_for(t).adapter or "manual").lower() == "self"
+        for t in cfg.enabled_targets()
+    )
+    if uses_self and cfg.source_flush.enabled:
+        cfg.source_flush.enabled = False
+        warnings.append(
+            "有目标使用 mirror_control.adapter=self（就地同步）时 source_flush 不生效"
+            "（save-off 只会发给本机，而本机正是要写入的目标），已自动关闭；"
+            "需要先让源端落盘的，请在源服上单独执行 save-all flush"
+        )
     return warnings
 
 
