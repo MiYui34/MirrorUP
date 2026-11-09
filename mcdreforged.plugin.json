@@ -2,7 +2,10 @@
   "id": "mirror_up",
   "version": "0.6.0",
   "name": "MirrorUP",
-  "description": "Incremental mirror sync for MCDR: changed files, region chunks and external chunks; multi-target, verify/history, cross-machine agent, MCSM/rcon/external/self auto stop; run it on the server you want to sync",
+  "description": {
+    "en_us": "Incremental mirror sync: only changed files and changed region chunks are transferred.",
+    "zh_cn": "镜像服增量同步：只传变更的文件与变更的 region chunk。"
+  },
   "author": [
     "MiYui34"
   ],
