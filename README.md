@@ -20,7 +20,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 
 需要 MCDR ≥ 2.12.0、Python ≥ 3.9。
 
-1. 把插件目录放进 MCDR 的 `plugins/`（目录名建议 `MirrorUP`）。
+1. 从 [Releases](https://github.com/MiYui34/MirrorUP/releases) 下载 `MirrorUP-v0.6.0.mcdr` 放进 MCDR 的 `plugins/`；或者把仓库里的 `MirrorUP/` 目录放进去（目录名建议 `MirrorUP`）。
 2. 安装依赖：`pip install xxhash`。MCDR 只校验依赖、不会自动安装，缺依赖会在日志里报 `RequirementCheckFailure`。
 3. 重启 MCDR，首次加载会生成 `config/mirror_up/config.json`。
 
