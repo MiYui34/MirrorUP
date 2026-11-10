@@ -22,7 +22,7 @@ MCDR ≥ 2.12.0, Python ≥ 3.9, `xxhash`.
 
 ## Install
 
-1. Put the plugin into MCDR's `plugins/` directory (the packed `MirrorUP-v0.6.1.mcdr` or the `MirrorUP/` folder).
+1. Put the plugin into MCDR's `plugins/` directory (the packed `MirrorUP-v0.6.2.mcdr` or the `MirrorUP/` folder).
 2. `pip install xxhash`. MCDR only verifies requirements, it does not install them; a missing package shows `RequirementCheckFailure` in the log.
 3. Restart MCDR. `config/mirror_up/config.json` is generated on first load.
 
@@ -111,9 +111,9 @@ The exporter is read-only: it never writes and never runs sync commands. `source
 
 ## Version
 
-`0.6.1` — file-level + chunk-level increment, in-place region writes (header journal + compaction), mirror drift recovery, scheduled sync, cross-machine agent transport (with TLS), `.mcc` external chunk increment and orphan cleanup, multiple mirror targets, verify & history, MCSM/rcon/external/self auto stop, in-place sync (`adapter: "self"`), Python API.
+`0.6.2` — file-level + chunk-level increment, in-place region writes (header journal + compaction), mirror drift recovery, scheduled sync, cross-machine agent transport (with TLS), `.mcc` external chunk increment and orphan cleanup, multiple mirror targets, verify & history, MCSM/rcon/external/self auto stop, in-place sync (`adapter: "self"`), Python API.
 
-`0.6.1` fix: `!!MCDR plugin install mirror_up` used to fail with `Invalid chat component: Illegal character in path` because MCDR builds the PyPI link from the raw requirement string (`xxhash>=3.0`) and `>` is not a legal URL character. The requirement is now declared as plain `xxhash`.
+`0.6.2` fix: `!!MCDR plugin install mirror_up` used to fail with `Invalid chat component: Illegal character in path` because MCDR builds the PyPI link from the raw requirement string (`xxhash>=3.0`) and `>` is not a legal URL character. The catalogue reads the dependency list from `requirements.txt` in the repository (not from the `requirements` field in `mcdreforged.plugin.json`), so 0.6.1 only changing the latter had no effect; 0.6.2 also changes `requirements.txt` to plain `xxhash`.
 
 ## License
 
