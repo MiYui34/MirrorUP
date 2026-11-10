@@ -22,6 +22,7 @@ import hmac
 import json
 import logging
 import os
+import socketserver
 import ssl
 import stat as stat_module
 import sys
@@ -172,6 +173,15 @@ class _QuietServer(ThreadingHTTPServer):
     """客户端提前断开是常态（driver 取消、进程退出），不要刷 traceback。"""
 
     daemon_threads = True
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind() 会调用 socket.getfqdn(host) 做反向 DNS，
+        # 在 macOS 或没有可用 DNS 的机器上可能阻塞十几秒，把 MCDR 的
+        # TaskExecutor 卡到 WatchDog 报警。这里只做 TCPServer 的绑定。
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
 
     def handle_error(self, request, client_address) -> None:  # type: ignore[no-untyped-def]
         exc = sys.exc_info()[1]
