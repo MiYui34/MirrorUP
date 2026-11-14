@@ -701,7 +701,16 @@ class SyncEngine:
             op.region = True
             row = self.index.get_region(ctx.set_id, op.path, ctx.target_id)
             op.region_state = row[0] if row else None
-            op.dirty_since = None if (distrust or op.force_write) else dirty_since
+            floor = row[2] if row else None
+            if distrust or op.force_write:
+                op.dirty_since = None
+            elif floor is not None:
+                # 这个 region 上一次**成功**写入的那一轮的开始时间。写失败、
+                # 被延后或被取消的 region 不会推进它，所以那些 chunk 下一轮
+                # 仍然算脏，不会被“未变”的判定永久漏掉。
+                op.dirty_since = floor
+            else:
+                op.dirty_since = dirty_since
 
     # ------------------------------------------------------------------ #
     # 执行
@@ -837,8 +846,17 @@ class SyncEngine:
                 )
                 if result.region_state is not None:
                     self.index.put_region(
-                        ctx.set_id, op.path, result.region_state, None, ctx.target_id
+                        ctx.set_id,
+                        op.path,
+                        result.region_state,
+                        None,
+                        ctx.target_id,
+                        floor=int(report.started_at),
                     )
+                elif op.region:
+                    # 走了整文件兜底（外置 chunk / 头损坏）：chunk 状态已经不可信，
+                    # 下一轮整份重扫。
+                    self.index.delete_region(ctx.set_id, op.path, ctx.target_id)
             self.index.clear_pending(ctx.set_id, op.path, ctx.target_id)
 
         elif result.status == "unchanged":
@@ -860,8 +878,15 @@ class SyncEngine:
             )
             if result.region_state is not None:
                 self.index.put_region(
-                    ctx.set_id, op.path, result.region_state, None, ctx.target_id
+                    ctx.set_id,
+                    op.path,
+                    result.region_state,
+                    None,
+                    ctx.target_id,
+                    floor=int(report.started_at),
                 )
+            elif op.region:
+                self.index.delete_region(ctx.set_id, op.path, ctx.target_id)
             self.index.clear_pending(ctx.set_id, op.path, ctx.target_id)
 
         elif result.status == "deleted":

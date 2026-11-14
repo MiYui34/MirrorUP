@@ -6,13 +6,15 @@ import re
 
 APP_ID = "mirror_up"
 APP_NAME = "MirrorUP"
-VERSION = "0.6.4"
+VERSION = "0.6.5"
 
 #: 索引与配置的 schema 版本，迁移时使用。
 #: v2：sync.region_delta 默认改为 true（v0.2 chunk 级增量真正生效）。
 #: v3：sync.region_write_mode 默认 inplace（v0.3 追加式写入）。
 #: v4：新增 agent_server 段与 source.transport=agent（v0.4 跨机传输）。
-SCHEMA_VERSION = 5
+#: v5：多镜像目标（target_id）。
+#: v6：regions 表新增 floor 列（region 脏扫描下限，v0.6.5）。
+SCHEMA_VERSION = 6
 
 #: 索引文件名（位于 MCDR 插件数据目录）。
 INDEX_FILENAME = "index.sqlite3"

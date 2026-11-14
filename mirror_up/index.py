@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS regions (
   path         TEXT    NOT NULL,
   chunk_hashes BLOB    NOT NULL,
   header       BLOB,
+  -- 上一次成功写入这个 region 的那一轮的开始时间（Unix 秒）。
+  -- 下一轮用它当脏扫描下限：写失败/被取消的 region 不会把下限推过去，
+  -- 否则那些 chunk 会被当成“没变”而永久漏同步。
+  floor        INTEGER,
   PRIMARY KEY (target_id, set_id, path)
 ) WITHOUT ROWID;
 
@@ -155,6 +159,7 @@ class Index:
         """v0.4 及更早的索引没有 target_id / targets / history，就地升级。"""
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(files)")}
         if "target_id" in columns:
+            self._migrate_region_floor()
             return
         logger.info("[MirrorUP] 索引升级到 schema v5（多镜像目标）")
         self._conn.executescript(
@@ -184,6 +189,15 @@ class Index:
         self._conn.executescript(
             "DROP TABLE files_v4; DROP TABLE regions_v4; DROP TABLE pending_v4;"
         )
+        self._migrate_region_floor()
+
+    def _migrate_region_floor(self) -> None:
+        """v0.6 及更早的 regions 表没有 floor 列。"""
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(regions)")}
+        if "floor" in columns:
+            return
+        logger.info("[MirrorUP] 索引升级到 schema v6（region 脏扫描下限）")
+        self._conn.execute("ALTER TABLE regions ADD COLUMN floor INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -449,16 +463,20 @@ class Index:
 
     def get_region(
         self, set_id: int, path: str, target_id: int = DEFAULT_TARGET_ID
-    ) -> Optional[Tuple[bytes, Optional[bytes]]]:
+    ) -> Optional[Tuple[bytes, Optional[bytes], Optional[int]]]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT chunk_hashes, header FROM regions "
+                "SELECT chunk_hashes, header, floor FROM regions "
                 "WHERE target_id = ? AND set_id = ? AND path = ?",
                 (target_id, set_id, path),
             ).fetchone()
         if row is None:
             return None
-        return bytes(row[0]), (bytes(row[1]) if row[1] is not None else None)
+        return (
+            bytes(row[0]),
+            (bytes(row[1]) if row[1] is not None else None),
+            (int(row[2]) if row[2] is not None else None),
+        )
 
     def put_region(
         self,
@@ -467,15 +485,29 @@ class Index:
         chunk_hashes: bytes,
         header: Optional[bytes],
         target_id: int = DEFAULT_TARGET_ID,
+        floor: Optional[int] = None,
     ) -> None:
         with self._lock:
             self._begin_locked()
             self._conn.execute(
-                "INSERT INTO regions(target_id, set_id, path, chunk_hashes, header) "
-                "VALUES(?, ?, ?, ?, ?) "
+                "INSERT INTO regions(target_id, set_id, path, chunk_hashes, header, floor) "
+                "VALUES(?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(target_id, set_id, path) DO UPDATE SET "
-                "chunk_hashes = excluded.chunk_hashes, header = excluded.header",
-                (target_id, set_id, path, chunk_hashes, header),
+                "chunk_hashes = excluded.chunk_hashes, header = excluded.header, "
+                "floor = COALESCE(excluded.floor, regions.floor)",
+                (target_id, set_id, path, chunk_hashes, header, floor),
+            )
+            self._after_write()
+
+    def delete_region(
+        self, set_id: int, path: str, target_id: int = DEFAULT_TARGET_ID
+    ) -> None:
+        """忘掉一个 region 的 chunk 状态（下一轮会整份重扫）。"""
+        with self._lock:
+            self._begin_locked()
+            self._conn.execute(
+                "DELETE FROM regions WHERE target_id = ? AND set_id = ? AND path = ?",
+                (target_id, set_id, path),
             )
             self._after_write()
 
