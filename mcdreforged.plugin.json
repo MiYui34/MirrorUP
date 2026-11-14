@@ -1,6 +1,6 @@
 {
   "id": "mirror_up",
-  "version": "0.6.3",
+  "version": "0.6.4",
   "name": "MirrorUP",
   "description": {
     "en_us": "Incremental mirror sync: only changed files and changed region chunks are transferred.",

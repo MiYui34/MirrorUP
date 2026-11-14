@@ -23,6 +23,7 @@ import http.client
 import json
 import os
 import ssl
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Iterator, Optional, Sequence, Tuple
@@ -250,8 +251,12 @@ class _HttpClient:
         self.token = cfg.token or ""
         self.pin = (cfg.tls_pin_sha256 or "").strip().lower()
         self.timeout = timeout
+        self.verify_copy = bool(getattr(cfg, "verify_copy", True))
+        #: 每线程一条 keep-alive 连接：跨机同步时逐个文件新建 TCP（甚至 TLS）
+        #: 连接的握手开销远大于文件本身，几万个小文件时会慢到不可用。
+        self._tls = threading.local()
 
-    def _connection(self) -> http.client.HTTPConnection:
+    def _new_connection(self) -> http.client.HTTPConnection:
         if self.scheme == "https":
             context = ssl.create_default_context()
             if self.pin:
@@ -262,6 +267,47 @@ class _HttpClient:
                 self.host, self.port, timeout=self.timeout, context=context
             )
         return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+
+    def _open(self) -> Tuple[http.client.HTTPConnection, bool]:
+        """取本线程的连接；第二个返回值表示拿到的是一条复用的旧连接。"""
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            return conn, True
+        conn = self._new_connection()
+        self._tls.conn = conn
+        return conn, False
+
+    def _drop(self, conn: http.client.HTTPConnection) -> None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不该影响主流程
+            pass
+        if getattr(self._tls, "conn", None) is conn:
+            self._tls.conn = None
+
+    def _request(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+        # keep-alive 的连接可能已经被对端或中间的 NAT 关掉：复用连接失败时
+        # 换一条新连接重试一次，不要把整轮同步拖挂。
+        for attempt in (0, 1):
+            conn, reused = self._open()
+            try:
+                conn.request(method, self.base + url, body=body, headers=headers or self._headers())
+                self._verify_pin(conn)
+                return conn, conn.getresponse()
+            except (OSError, http.client.HTTPException) as exc:
+                self._drop(conn)
+                if reused and attempt == 0:
+                    continue
+                raise SourceUnavailable(
+                    f"无法连接 agent {self.host}:{self.port}：{exc}"
+                ) from exc
+        raise SourceUnavailable(f"无法连接 agent {self.host}:{self.port}")  # pragma: no cover
 
     def _verify_pin(self, conn: http.client.HTTPConnection) -> None:
         if not self.pin or self.scheme != "https":
@@ -287,19 +333,17 @@ class _HttpClient:
     @contextmanager
     def stream(self, path: str, params: Optional[Dict[str, str]] = None) -> Iterator[http.client.HTTPResponse]:
         url = path if not params else f"{path}?{urlencode(params)}"
-        conn = self._connection()
+        conn, resp = self._request("GET", url)
         try:
-            conn.request("GET", self.base + url, headers=self._headers())
-            self._verify_pin(conn)
-            resp = conn.getresponse()
-            try:
-                yield resp
-            finally:
-                resp.close()
+            yield resp
         except (OSError, http.client.HTTPException) as exc:
-            raise SourceUnavailable(f"无法连接 agent {self.host}:{self.port}：{exc}") from exc
+            self._drop(conn)
+            raise SourceUnavailable(f"读取 agent 响应失败：{exc}") from exc
         finally:
-            conn.close()
+            complete = resp.isclosed()
+            resp.close()
+            if resp.will_close or not complete:
+                self._drop(conn)
 
     def get_with_status(
         self, path: str, params: Optional[Dict[str, str]] = None, body: Optional[bytes] = None
@@ -307,22 +351,26 @@ class _HttpClient:
         """和 :meth:`get` 一样，但把状态码交给调用方判断（401 仍然直接抛）。"""
         method = "POST" if body is not None else "GET"
         url = path if not params else f"{path}?{urlencode(params)}"
-        conn = self._connection()
         extra = {"Content-Type": "application/octet-stream"} if body is not None else None
+        conn, resp = self._request(method, url, body=body, headers=self._headers(extra))
         try:
-            conn.request(method, self.base + url, body=body, headers=self._headers(extra))
-            self._verify_pin(conn)
-            resp = conn.getresponse()
             data = resp.read()
-            status = resp.status
         except (OSError, http.client.HTTPException) as exc:
-            raise SourceUnavailable(f"无法连接 agent {self.host}:{self.port}：{exc}") from exc
-        finally:
-            conn.close()
+            self._drop(conn)
+            raise SourceUnavailable(f"读取 agent 响应失败：{exc}") from exc
+        status = resp.status
+        resp.close()
+        if resp.will_close:
+            self._drop(conn)
 
         if status == 401:
             raise SourceUnavailable("agent 鉴权失败（token 不匹配）")
         return status, data
+
+    def close(self) -> None:
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            self._drop(conn)
 
     def get(
         self, path: str, params: Optional[Dict[str, str]] = None, body: Optional[bytes] = None
@@ -432,17 +480,23 @@ class AgentSource(Source):
                 fout.flush()
                 os.fsync(fout.fileno())
 
-        current = self.stat(rel)
-        if current is None:
-            raise SourceVanished(f"agent 上源文件在读取期间消失：{rel}")
-        if expected is not None and expected != current:
-            raise UnstableSource(
-                f"源文件在读取期间被改写（{expected[0]}B@{expected[1]} → "
-                f"{current[0]}B@{current[1]}）"
-            )
-        if written != current[0]:
-            raise UnstableSource(f"读取字节数与源端不一致（{written} != {current[0]}）")
-        return hasher.digest(), written, current[1]
+        if self.client.verify_copy or expected is None:
+            current = self.stat(rel)
+            if current is None:
+                raise SourceVanished(f"agent 上源文件在读取期间消失：{rel}")
+            if expected is not None and expected != current:
+                raise UnstableSource(
+                    f"源文件在读取期间被改写（{expected[0]}B@{expected[1]} → "
+                    f"{current[0]}B@{current[1]}）"
+                )
+            if written != current[0]:
+                raise UnstableSource(f"读取字节数与源端不一致（{written} != {current[0]}）")
+            return hasher.digest(), written, current[1]
+
+        # verify_copy=false：信任响应头里的 (size, mtime_ns)，省掉每个文件一次往返
+        if written != expected[0]:
+            raise UnstableSource(f"读取字节数与源端不一致（{written} != {expected[0]}）")
+        return hasher.digest(), written, expected[1]
 
     # -- region --------------------------------------------------------- #
 
@@ -537,6 +591,7 @@ class AgentSource(Source):
 
     def close(self) -> None:
         self._record_cache.clear()
+        self.client.close()
 
 
 # --------------------------------------------------------------------------- #

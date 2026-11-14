@@ -20,7 +20,7 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 
 需要 MCDR ≥ 2.12.0、Python ≥ 3.9。
 
-1. 从 [Releases](https://github.com/MiYui34/MirrorUP/releases) 下载 `MirrorUP-v0.6.3.mcdr` 放进 MCDR 的 `plugins/`；或者把仓库里的 `MirrorUP/` 目录放进去（目录名建议 `MirrorUP`）。
+1. 从 [Releases](https://github.com/MiYui34/MirrorUP/releases) 下载 `MirrorUP-v0.6.4.mcdr` 放进 MCDR 的 `plugins/`；或者把仓库里的 `MirrorUP/` 目录放进去（目录名建议 `MirrorUP`）。
 2. 安装依赖：`pip install xxhash`。MCDR 只校验依赖、不会自动安装，缺依赖会在日志里报 `RequirementCheckFailure`。
 3. 重启 MCDR，首次加载会生成 `config/mirror_up/config.json`。
 
@@ -43,12 +43,13 @@ MCDR 镜像服**增量**同步插件：只传真正变了的文件，`.mca` 再�
 | `source.agent.url` | `http://127.0.0.1:25580` | exporter 地址（`transport=agent` 时用） |
 | `source.agent.token` | 空 | 与 exporter 的 `agent_server.token` 一致 |
 | `source.agent.tls_pin_sha256` | 空 | 可选，固定自签证书指纹 |
+| `source.agent.verify_copy` | `true` | 每个文件下载完再发一次 `/v1/stat` 复核；跨机高延迟时可设 `false` 省掉一半往返 |
 | `role` | `driver` | `driver` 执行同步；`exporter` 只对外提供数据 |
 | `target.root` | `./Mirror/server` | 镜像服目录（单目标时的简写；等价于 `targets[0]`） |
 | `targets` | 一个 `default` | 多镜像目标：`[{"name","root","enabled","mirror_control"?}]`，每个目标可覆盖停服配置 |
 | `sets` | `world`、`mods` | 同步哪些目录；`config/`、`server.properties` 默认不同步 |
 | `exclude` | `session.lock`、`*.tmp`、`logs/**` 等 | glob 排除，命中目录整棵跳过 |
-| `sync.concurrency` | `4` | 并行拷贝数 |
+| `sync.concurrency` | `8` | 并行拷贝数；跨机高延迟链路可以调到 16 |
 | `sync.verify_target` | `true` | 每轮检查镜像是否被改动 |
 | `sync.region_delta` | `true` | `.mca` 走 chunk 级增量，`false` 退回整文件 |
 | `sync.region_write_mode` | `inplace` | `inplace` 原地追加，`rebuild` 重建后替换 |
@@ -146,11 +147,13 @@ exporter 只读：它不写任何东西，也不执行同步命令。`!!mu statu
 
 ## 版本
 
-当前 `0.6.3`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、`.mcc` 外置 chunk 增量与孤儿清理、多镜像目标（共享索引）、校验与同步历史、MCSM/rcon/external 自动停服、**就地同步（`adapter: "self"`：命令在哪台服敲就停/写/启哪台服）**、Python API。
+当前 `0.6.4`：文件级 + chunk 级增量、原地写 region（含头 journal 与碎片整理）、镜像纠偏、定时同步、跨机 agent 传输（含 TLS）、`.mcc` 外置 chunk 增量与孤儿清理、多镜像目标（共享索引）、校验与同步历史、MCSM/rcon/external 自动停服、**就地同步（`adapter: "self"`：命令在哪台服敲就停/写/启哪台服）**、Python API。
 
 `0.6.2` 修复：`!!MCDR plugin install mirror_up` 时，依赖列表里的 `xxhash>=3.0` 会被 MCDR 直接拼成 PyPI 链接，`>` 在 URL 里非法，服务端解析聊天组件时报 `Invalid chat component: Illegal character in path`。插件库的依赖列表读的是仓库里的 `requirements.txt`（不是 `mcdreforged.plugin.json` 的 `requirements` 字段），所以 0.6.1 只改后者没有生效；0.6.2 把 `requirements.txt` 也改成不带版本约束的 `xxhash`。
 
 `0.6.3` 修复：以 `role: "exporter"` 加载插件时，agent 绑定端口会走 `HTTPServer.server_bind()`，其中 `socket.getfqdn()` 的反向 DNS 查询在 macOS 上可能阻塞十几秒，触发 MCDR 的 `TaskExecutor 线程已经 10 秒没有响应` 警告。现在改为直接绑定，不再做反向解析。
+
+`0.6.4` 修复：跨机同步时每个文件都新建一条 TCP 连接（下载完还要再发一次 `/v1/stat` 复核），几万个小文件时光是握手就要几个小时。现在每个线程复用一条 keep-alive 连接，连接被对端关掉时自动换新重试；`sync.concurrency` 默认从 4 提到 8；新增 `source.agent.verify_copy`（默认 `true`），设为 `false` 可省掉每个文件那次复核往返。
 
 ## 许可证
 

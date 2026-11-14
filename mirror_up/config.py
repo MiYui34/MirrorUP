@@ -33,7 +33,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "source": {
         "root": "./server",
         "transport": "local",
-        "agent": {"url": "http://127.0.0.1:25580", "token": "", "tls_pin_sha256": ""},
+        "agent": {"url": "http://127.0.0.1:25580", "token": "", "tls_pin_sha256": "", "verify_copy": True},
         "mtime_precision_sec": 0,
     },
     "target": {"root": "./Mirror/server"},
@@ -45,7 +45,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "exclude": list(DEFAULT_EXCLUDE),
     "sync": {
         "hash": "xxh3-128",
-        "concurrency": 4,
+        "concurrency": 8,
         "trust_mtime": True,
         "verify_target": True,
         "region_delta": True,
@@ -111,6 +111,8 @@ class AgentConfig:
     url: str = "http://127.0.0.1:25580"
     token: str = ""
     tls_pin_sha256: str = ""
+    #: 下载完一个文件后是否再发一次 /v1/stat 复核（每文件多一个往返）。
+    verify_copy: bool = True
 
 
 @dataclass
@@ -143,7 +145,7 @@ class SetConfig:
 @dataclass
 class SyncConfig:
     hash: str = "xxh3-128"
-    concurrency: int = 4
+    concurrency: int = 8
     trust_mtime: bool = True
     #: 每轮花一次 stat 扫描检查镜像侧是否被改过（被改过就重推）。
     verify_target: bool = True
@@ -478,6 +480,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
                 url=_as_str(agent_raw.get("url"), "http://127.0.0.1:25580"),
                 token=_as_str(agent_raw.get("token"), ""),
                 tls_pin_sha256=_as_str(agent_raw.get("tls_pin_sha256"), ""),
+                verify_copy=_as_bool(agent_raw.get("verify_copy"), True),
             ),
             mtime_precision_sec=max(0, _as_int(source_raw.get("mtime_precision_sec"), 0)),
         ),
@@ -487,7 +490,7 @@ def parse_config(raw: Dict[str, Any]) -> Config:
         exclude=exclude,
         sync=SyncConfig(
             hash=_as_str(sync_raw.get("hash"), "xxh3-128"),
-            concurrency=max(1, min(32, _as_int(sync_raw.get("concurrency"), 4))),
+            concurrency=max(1, min(32, _as_int(sync_raw.get("concurrency"), 8))),
             trust_mtime=_as_bool(sync_raw.get("trust_mtime"), True),
             verify_target=_as_bool(sync_raw.get("verify_target"), True),
             region_delta=_as_bool(sync_raw.get("region_delta"), True),
@@ -864,6 +867,7 @@ def config_to_dict(cfg: Config) -> Dict[str, Any]:
                 "url": cfg.source.agent.url,
                 "token": cfg.source.agent.token,
                 "tls_pin_sha256": cfg.source.agent.tls_pin_sha256,
+                "verify_copy": cfg.source.agent.verify_copy,
             },
             "mtime_precision_sec": cfg.source.mtime_precision_sec,
         },

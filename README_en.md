@@ -22,7 +22,7 @@ MCDR ≥ 2.12.0, Python ≥ 3.9, `xxhash`.
 
 ## Install
 
-1. Put the plugin into MCDR's `plugins/` directory (the packed `MirrorUP-v0.6.3.mcdr` or the `MirrorUP/` folder).
+1. Put the plugin into MCDR's `plugins/` directory (the packed `MirrorUP-v0.6.4.mcdr` or the `MirrorUP/` folder).
 2. `pip install xxhash`. MCDR only verifies requirements, it does not install them; a missing package shows `RequirementCheckFailure` in the log.
 3. Restart MCDR. `config/mirror_up/config.json` is generated on first load.
 
@@ -111,11 +111,13 @@ The exporter is read-only: it never writes and never runs sync commands. `source
 
 ## Version
 
-`0.6.3` — file-level + chunk-level increment, in-place region writes (header journal + compaction), mirror drift recovery, scheduled sync, cross-machine agent transport (with TLS), `.mcc` external chunk increment and orphan cleanup, multiple mirror targets, verify & history, MCSM/rcon/external/self auto stop, in-place sync (`adapter: "self"`), Python API.
+`0.6.4` — file-level + chunk-level increment, in-place region writes (header journal + compaction), mirror drift recovery, scheduled sync, cross-machine agent transport (with TLS), `.mcc` external chunk increment and orphan cleanup, multiple mirror targets, verify & history, MCSM/rcon/external/self auto stop, in-place sync (`adapter: "self"`), Python API.
 
 `0.6.2` fix: `!!MCDR plugin install mirror_up` used to fail with `Invalid chat component: Illegal character in path` because MCDR builds the PyPI link from the raw requirement string (`xxhash>=3.0`) and `>` is not a legal URL character. The catalogue reads the dependency list from `requirements.txt` in the repository (not from the `requirements` field in `mcdreforged.plugin.json`), so 0.6.1 only changing the latter had no effect; 0.6.2 also changes `requirements.txt` to plain `xxhash`.
 
 `0.6.3` fix: loading the plugin as `role: "exporter"` could block for seconds while binding the agent port, because `HTTPServer.server_bind()` calls `socket.getfqdn()` for a reverse DNS lookup; on macOS this made MCDR's watchdog report `TaskExecutor has not responded for 10 seconds`. The server now binds directly without the lookup.
+
+`0.6.4` fix: cross-machine sync opened a new TCP connection for every file (plus a second `/v1/stat` request to verify each download), so tens of thousands of small files spent hours in handshakes alone. Each worker thread now reuses one keep-alive connection and transparently reconnects when the peer closes it; `sync.concurrency` defaults to 8; new `source.agent.verify_copy` (default `true`) can be set to `false` to skip the per-file verification round trip.
 
 ## License
 
